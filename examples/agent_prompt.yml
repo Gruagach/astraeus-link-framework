@@ -1,0 +1,101 @@
+# Architecture Overview
+
+Astraeus Link Framework의 전체 구조를 한눈에 볼 수 있는 다이어그램과 함께 각 모듈의 역할 및 데이터 흐름을 설명합니다. 이 프레임워크는 사용자 질문을 입력으로 받아, 메타 지표 기반 분석과 단계별 워크플로우 실행을 통해 자동 보정, 외부 검색 및 경고 알림을 수행합니다.
+
+> **PDF 포함 안내**: Mermaid 다이어그램은 텍스트 기반이므로, PDF에 포함하려면 다음 중 하나를 선택하세요:
+>
+> 1. Mermaid CLI나 Pandoc의 HTML→PDF 변환 기능을 사용해 다이어그램을 이미지로 렌더링 후 삽입
+> 2. 로컬에서 다이어그램을 PNG/SVG로 내보낸 뒤 Markdown에서 `![Diagram](diagram.png)` 형식으로 삽입
+
+```mermaid
+flowchart TB
+  %% Data Layer
+  subgraph Data Layer
+    D1[User Input]\n("질문, 키워드 등")
+    D2[Keywords]\n(추출된 키워드 세트)
+    D3[Metrics Store]\n(ΔS, ΔR 등 지표 기록)
+    D4[Logs]\n(ψ-log, 실행 이력)
+  end
+  %% Agent Layer
+  subgraph Agent Layer
+    A1[agent_prompt.yml]\n(Jinja 설정 템플릿)
+    A2[src/astraeus_agent.py]\n(에이전트 클래스)
+  end
+  %% Processing Layer
+  subgraph Processing Layer
+    P1[Prompt Parser]\n(템플릿 렌더링)
+    P2[Meta Engine]\n(지표 평가 및 조정)
+    P3[Canvas Manager]\n(단계별 워크플로우)
+    P4[External Connector]\n(브라우저/API 호출)
+    P5[Alert Loop]\n(경보 및 피드백 루프)
+  end
+
+  D1 -->|입력 전달| A1
+  A1 -->|템플릿 렌더링| P1
+  P1 -->|키워드 분석| D2
+  D2 -->|파라미터 제공| P2
+  A2 -->|메서드 호출| P2
+  P2 -->|단계 수 결정| P3
+  P3 -->|워크플로우 실행| P4
+  P4 -->|외부 데이터 조회| D3
+  P2 -->|경고 조건 평가| P5
+  P5 -->|경보 발송 및 피드백| D4
+  P5 -->|피드백 반영| P2
+```
+
+---
+
+## 각 모듈 상세 설명
+
+### 1. Agent Layer
+
+* **`agent_prompt.yml`**
+
+  * **역할**: 프레임워크의 핵심 설정을 Jinja 템플릿으로 정의합니다.
+
+    * 메타 지표(`TARGET_ΔS`, `TARGET_ΔR`), 분기 로직(`STEPS`), 캔버스 워크플로(`CANVAS`), 위험-탄성 규칙 등을 포함
+  * **입력**: 사용자 질문(User Input)
+  * **출력**: 초깃값 파라미터(키워드 목록, 단계 수, 메타 지표 임계치)
+
+* **`src/astraeus_agent.py`**
+
+  * **역할**: Agent의 엔트리 포인트로, 전체 처리 흐름을 제어하는 클래스 구현
+  * **주요 메서드**:
+
+    1. `load_template(path)` – YAML/Jinja 템플릿 로딩
+    2. `parse_prompt(question)` – 질문을 기반으로 템플릿 렌더링 및 파라미터 추출
+    3. `process_question(question)` – 파이프라인 전체 실행, 최종 응답 반환
+    4. `evaluate_meta(metrics)` – 메타 지표 비교·조정
+    5. `run_canvas(step_config)` – M1\~M5 단계 워크플로우 실행
+    6. `trigger_external_search(criteria)` – 외부 검색/API 호출
+    7. `alert_loop(metrics)` – 경보 조건 모니터링 및 알림 발송
+
+### 2. Processing Layer
+
+1. **Prompt Parser** (`parse_prompt`)
+
+   * `agent_prompt.yml`에서 Jinja 렌더링 수행 후 질문 길이, 키워드 포인트, 단계 수(STEPS) 결정합니다.
+2. **Meta Engine** (`evaluate_meta`)
+
+   * 입력된 메타 지표(`ΔS`, `ΔR`)를 기준치와 비교하여 `ΔR` 값 자동 조정
+   * `FRAME_DIVERGENCE_THETA`와 `ELASTICITY_SIGMA_TIERS`를 활용한 추가 알림 조건 평가
+3. **Canvas Manager** (`run_canvas`)
+
+   * CANVAS 단계(M1\~M5)를 순차 수행하며, 각 단계별 `ψ-log`, 함수 추상화, 외부 검증, 회고, 경고 루프 등을 실행
+4. **External Connector** (`trigger_external_search`)
+
+   * `SEARCH_CRITERIA` 설정에 맞춰 브라우저 또는 API 호출로 외부 데이터 수집 → `Metrics Store`에 저장
+5. **Alert Loop** (`alert_loop`)
+
+   * 실시간 모니터링 지표(Logs, Metrics Store)를 분석해 임계치 초과 시 관리자 알림 및 메타 엔진 피드백 트리거
+
+### 3. Data Layer
+
+* **User Input**: 최종 사용자의 질문, 컨텍스트 문자열
+* **Keywords**: Prompt Parser가 추출한 키워드 리스트(집합)
+* **Metrics Store**: 외부 검색 및 내부 연산 결과로 기록된 메타 지표(ΔS, ΔR, σ 등)
+* **Logs**: `ψ-log` 등 로그 모듈을 통해 저장된 실행 이력 및 이벤트 로그
+
+---
+
+*이 문서는 Astraeus Link Framework v1.2 기준으로 작성되었으며, 실제 구현 시 참고용으로 활용하세요.*
