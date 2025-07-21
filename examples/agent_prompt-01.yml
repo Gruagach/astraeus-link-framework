@@ -1,0 +1,66 @@
+# Astraeus Link Agent 설정 예시 (agent\_prompt.yml)
+
+```yaml
+# ------------------------------
+# 1. 메타 기준 (Meta Criteria)
+# ------------------------------
+TARGET_ΔS: -0.05         # 구조 변화 목표 (ΔS: Structure change magnitude)
+TARGET_ΔR: +0.03         # 연관성 변화 목표
+ΔS_GRAD_THRESHOLD: 0.01  # 변경 속도 임계치
+FRAME_DIVERGENCE_THETA: 0.35
+ELASTICITY_SIGMA_TIERS: [0.005, 0.01, 0.02]
+
+# ------------------------------
+# 2. 분기 로직 (Branching Logic)
+# ------------------------------
+# Variables:
+#   question: 사용자의 입력 문자열
+#   keywords: 추출된 키워드 리스트
+
+# 질문 길이와 키워드에 따라 STEP 수 결정
+{% if question | length >= 80 or (keywords & ['실험', 'PoC', '검증']) | length > 0 %}
+STEPS: 7
+{% elif question | length >= 50 or (keywords & ['윤리', '최신', 'recent']) | length > 0 %}
+STEPS: 5
+{% else %}
+STEPS: 3
+{% endif %}
+
+# ------------------------------
+# 3. 위험-탄성 규칙 (Elasticity Rules)
+# ------------------------------
+ELASTICITY_RULE: |
+  # σ는 metrics['sigma'] 값을 의미합니다 (예: σ = metrics['sigma'])
+  σ < 0.005 => ΔR += 1
+  σ > 0.02  => ΔR -= 1
+
+# ------------------------------
+# 4. CANVAS 워크플로우
+# ------------------------------
+CANVAS:
+  M1: ['ψ-log', 'p_f']          # 초기 로깅 및 메트릭 기록 (Baseline log)
+  M2: ['함수 추상화', 'w₄·p_f']   # 핵심 함수 및 피처 추출 (Function abstraction)
+  M3: ['외부 검증']              # 외부 데이터/결과 검증 (External validation)
+  M3b: ['Frame Sentinel', 'θ 조정']  # 프레임 무결성 감시 및 임계값 조정 (Frame sentinel)
+  M4: ['A/B/C 테스트', '회고']    # 실험 설계 및 회고 분석 (Experiment & retrospective)
+  M5: ['CHI·ECR·ΔS·p_f 모니터', '경고']  # 메타 지표 모니터링 및 알림 기능 (Metrics alert)# ------------------------------
+CANVAS:
+  M1: ['ψ-log', 'p_f']
+  M2: ['함수 추상화', 'w₄·p_f']
+  M3: ['외부 검증']
+  M3b: ['Frame Sentinel', 'θ 조정']
+  M4: ['A/B/C 테스트', '회고']
+  M5: ['CHI·ECR·ΔS·p_f 모니터', '경고']
+
+# ------------------------------
+# 5. 외부 검색 (External Search Criteria)
+# ------------------------------
+SEARCH_CRITERIA:
+  freshness: {% if 'history' in keywords or '이론' in keywords %}'unlimited'{% else %}'1 month'{% endif %}  # 기본 '1 month', 숫자형 예시(예: 30)일 경우 30일로 처리
+  authority:
+    journal: 0.9
+    institution: 0.8
+    web: 0.5
+  relevance: 0.7
+
+```
