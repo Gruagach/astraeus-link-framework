@@ -1,0 +1,404 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
+import { Brain, Zap, Clock, Target, Network, Play, Pause, RefreshCw } from 'lucide-react';
+
+// Astraeus 시스템 구현
+class Event {
+  constructor(text) {
+    this.input = text;
+    this.tokens = text.split(' ');
+    this.prev_tokens = [...this.tokens];
+    this.delta_s = 0.0;
+    this.delta_r = 0.0;
+    this.chi = 0.0;
+    this.ecr = 0.0;
+    this.frame_divergence = false;
+    this.psi_log = [];
+  }
+
+  log(module, action) {
+    const entry = {
+      module,
+      action,
+      delta_s: this.delta_s,
+      delta_r: this.delta_r,
+      chi: this.chi,
+      ecr: this.ecr,
+      frame_divergence: this.frame_divergence,
+      timestamp: Date.now()
+    };
+    this.psi_log.push(entry);
+    return entry;
+  }
+}
+
+// 유틸리티 함수들
+const entropy = (tokens) => {
+  const total = tokens.length;
+  if (total === 0) return 0.0;
+  
+  const counts = {};
+  tokens.forEach(token => {
+    counts[token] = (counts[token] || 0) + 1;
+  });
+  
+  return -Object.values(counts).reduce((sum, count) => {
+    const p = count / total;
+    return sum + p * Math.log2(p);
+  }, 0);
+};
+
+const fetchCarbonPrice = () => 50.0 + (Math.random() - 0.5) * 2;
+const fetchHbmStatus = () => Math.random() * 0.5 + 0.5;
+
+const causalHarmonyIndex = (event) => {
+  const pathLen = 2; // stub
+  const base = Math.max(0.0, 1.0 - (pathLen - 1) * 0.1 - Math.abs(event.delta_s || 0.0) * 0.5);
+  return Math.min(Math.max(base, 0.0), 1.0);
+};
+
+const ethicalComplianceRate = (event) => {
+  const base = Math.max(0.0, 1.0 - (event.delta_r || 0.0) * 0.5);
+  return Math.min(Math.max(base, 0.0), 1.0);
+};
+
+const simpleLlmResponse = () => 
+  Math.random() > 0.5 ? "Affirmative argument" : "Negative argument";
+
+const hashgraphConsensus = (responses) => {
+  const affirmativeCount = responses.filter(r => r === "Affirmative argument").length;
+  return affirmativeCount > responses.length / 2;
+};
+
+// 모듈 클래스들
+class SpaceModule {
+  process(evt) {
+    evt.log("Space", "Rendered multilayer viewport");
+  }
+}
+
+class TimeModule {
+  process(evt) {
+    const newTokens = [...evt.prev_tokens, ...Array(Math.floor(Math.random() * 3)).fill("...")];
+    const prevEnt = entropy(evt.prev_tokens);
+    const newEnt = entropy(newTokens);
+    evt.delta_s = newEnt - prevEnt;
+    evt.prev_tokens = newTokens;
+    evt.log("Time", `Computed ΔS=${evt.delta_s.toFixed(4)}`);
+  }
+}
+
+class EnergyModule {
+  process(evt) {
+    const carbon = fetchCarbonPrice();
+    const hbm = fetchHbmStatus();
+    const volatility = Math.abs(evt.delta_s);
+    evt.delta_r = 0.01 + 0.3 * volatility + 0.001 * carbon + 0.05 * hbm;
+    evt.log("Energy", `Adjusted ΔR=${evt.delta_r.toFixed(4)} (carbon=${carbon.toFixed(1)}, hbm=${hbm.toFixed(2)})`);
+  }
+}
+
+class PsiModule {
+  process(evt) {
+    evt.chi = causalHarmonyIndex(evt);
+    evt.ecr = ethicalComplianceRate(evt);
+    evt.log("Psi", `Evaluated CHI=${evt.chi.toFixed(4)}, ECR=${evt.ecr.toFixed(4)}`);
+  }
+}
+
+class CausalityModule {
+  process(evt) {
+    const responses = Array(5).fill(null).map(() => simpleLlmResponse());
+    const consensus = hashgraphConsensus(responses);
+    evt.frame_divergence = !consensus;
+    evt.log("Causality", `Frame divergence=${evt.frame_divergence}`);
+  }
+}
+
+// 파이프라인 실행
+const runPipeline = (text) => {
+  const evt = new Event(text);
+  const modules = [
+    new SpaceModule(),
+    new TimeModule(),
+    new EnergyModule(),
+    new PsiModule(),
+    new CausalityModule()
+  ];
+  
+  modules.forEach(mod => mod.process(evt));
+  return evt;
+};
+
+const AstraeusDemo = () => {
+  const [inputText, setInputText] = useState("AI systems should prioritize human welfare and ethical considerations");
+  const [currentEvent, setCurrentEvent] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [history, setHistory] = useState([]);
+  const [autoMode, setAutoMode] = useState(false);
+  const autoIntervalRef = useRef(null);
+
+  const processInput = async (text = inputText) => {
+    setIsProcessing(true);
+    
+    // 각 모듈 처리를 시각적으로 보여주기 위한 지연
+    const evt = new Event(text);
+    const modules = [
+      new SpaceModule(),
+      new TimeModule(), 
+      new EnergyModule(),
+      new PsiModule(),
+      new CausalityModule()
+    ];
+
+    for (const mod of modules) {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      mod.process(evt);
+      setCurrentEvent({...evt});
+    }
+
+    // 히스토리에 추가
+    const historyEntry = {
+      timestamp: Date.now(),
+      input: text,
+      delta_s: evt.delta_s,
+      delta_r: evt.delta_r,
+      chi: evt.chi,
+      ecr: evt.ecr,
+      frame_divergence: evt.frame_divergence
+    };
+
+    setHistory(prev => [...prev.slice(-19), historyEntry]);
+    setIsProcessing(false);
+  };
+
+  const toggleAutoMode = () => {
+    if (autoMode) {
+      clearInterval(autoIntervalRef.current);
+    } else {
+      const sampleInputs = [
+        "Autonomous vehicles should prioritize passenger safety",
+        "Medical AI should explain its diagnostic reasoning",
+        "Financial algorithms must be transparent and fair",
+        "Social media AI should combat misinformation",
+        "Educational AI should adapt to individual learning styles"
+      ];
+      
+      autoIntervalRef.current = setInterval(() => {
+        const randomInput = sampleInputs[Math.floor(Math.random() * sampleInputs.length)];
+        processInput(randomInput);
+      }, 4000);
+    }
+    setAutoMode(!autoMode);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (autoIntervalRef.current) {
+        clearInterval(autoIntervalRef.current);
+      }
+    };
+  }, []);
+
+  const getModuleIcon = (module) => {
+    const icons = {
+      Space: <Network className="w-4 h-4" />,
+      Time: <Clock className="w-4 h-4" />,
+      Energy: <Zap className="w-4 h-4" />,
+      Psi: <Brain className="w-4 h-4" />,
+      Causality: <Target className="w-4 h-4" />
+    };
+    return icons[module] || <div className="w-4 h-4" />;
+  };
+
+  const getStatusColor = (value, type) => {
+    if (type === 'delta_s') return value < 0 ? 'text-red-400' : 'text-green-400';
+    if (type === 'delta_r') return value > 0.05 ? 'text-red-400' : 'text-yellow-400';
+    if (type === 'chi' || type === 'ecr') return value > 0.8 ? 'text-green-400' : value > 0.6 ? 'text-yellow-400' : 'text-red-400';
+    if (type === 'frame_divergence') return value ? 'text-red-400' : 'text-green-400';
+    return 'text-gray-400';
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-blue-900 to-purple-900 text-white p-6">
+      <div className="max-w-7xl mx-auto">
+        {/* 헤더 */}
+        <div className="text-center mb-8">
+          <h1 className="text-4xl font-bold bg-gradient-to-r from-cyan-400 to-purple-400 bg-clip-text text-transparent mb-2">
+            ASTRAEUS Ψ-SYSTEM
+          </h1>
+          <p className="text-xl text-gray-300">
+            Multi-Dimensional Causal Analysis & AI Consensus Engine
+          </p>
+        </div>
+
+        {/* 입력 섹션 */}
+        <div className="bg-white/5 backdrop-blur-lg rounded-2xl p-6 mb-6">
+          <div className="flex flex-col md:flex-row gap-4 items-center">
+            <input
+              type="text"
+              value={inputText}
+              onChange={(e) => setInputText(e.target.value)}
+              className="flex-1 bg-white/10 border border-white/20 rounded-lg px-4 py-3 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-cyan-400"
+              placeholder="Enter text for Ψ-analysis..."
+              disabled={isProcessing}
+            />
+            <div className="flex gap-2">
+              <button
+                onClick={() => processInput()}
+                disabled={isProcessing}
+                className="bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-600 hover:to-blue-600 disabled:opacity-50 px-6 py-3 rounded-lg font-medium transition-all duration-200 flex items-center gap-2"
+              >
+                {isProcessing ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+                {isProcessing ? 'Processing...' : 'Process'}
+              </button>
+              <button
+                onClick={toggleAutoMode}
+                className={`px-6 py-3 rounded-lg font-medium transition-all duration-200 flex items-center gap-2 ${
+                  autoMode 
+                    ? 'bg-red-500 hover:bg-red-600' 
+                    : 'bg-green-500 hover:bg-green-600'
+                }`}
+              >
+                {autoMode ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                {autoMode ? 'Stop Auto' : 'Auto Mode'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* 현재 메트릭 */}
+          <div className="bg-white/5 backdrop-blur-lg rounded-2xl p-6">
+            <h3 className="text-xl font-semibold mb-4 flex items-center gap-2">
+              <Brain className="w-5 h-5 text-cyan-400" />
+              Current Metrics
+            </h3>
+            {currentEvent ? (
+              <div className="space-y-4">
+                <div className="flex justify-between items-center">
+                  <span>Entropy Change (ΔS)</span>
+                  <span className={`font-mono text-lg ${getStatusColor(currentEvent.delta_s, 'delta_s')}`}>
+                    {currentEvent.delta_s.toFixed(4)}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span>Risk Elasticity (ΔR)</span>
+                  <span className={`font-mono text-lg ${getStatusColor(currentEvent.delta_r, 'delta_r')}`}>
+                    {currentEvent.delta_r.toFixed(4)}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span>Causal Harmony Index (CHI)</span>
+                  <span className={`font-mono text-lg ${getStatusColor(currentEvent.chi, 'chi')}`}>
+                    {currentEvent.chi.toFixed(4)}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span>Ethical Compliance Rate (ECR)</span>
+                  <span className={`font-mono text-lg ${getStatusColor(currentEvent.ecr, 'ecr')}`}>
+                    {currentEvent.ecr.toFixed(4)}
+                  </span>
+                </div>
+                <div className="flex justify-between items-center">
+                  <span>Frame Divergence</span>
+                  <span className={`font-mono text-lg ${getStatusColor(currentEvent.frame_divergence, 'frame_divergence')}`}>
+                    {currentEvent.frame_divergence ? 'TRUE' : 'FALSE'}
+                  </span>
+                </div>
+              </div>
+            ) : (
+              <div className="text-gray-400 text-center py-8">
+                No data processed yet. Enter text and click Process.
+              </div>
+            )}
+          </div>
+
+          {/* Ψ-Log */}
+          <div className="bg-white/5 backdrop-blur-lg rounded-2xl p-6">
+            <h3 className="text-xl font-semibold mb-4 flex items-center gap-2">
+              <Target className="w-5 h-5 text-purple-400" />
+              Ψ-Log Stream  
+            </h3>
+            <div className="space-y-2 max-h-80 overflow-y-auto">
+              {currentEvent?.psi_log.map((entry, idx) => (
+                <div key={idx} className="bg-black/20 rounded-lg p-3 text-sm font-mono">
+                  <div className="flex items-center gap-2 mb-1">
+                    {getModuleIcon(entry.module)}
+                    <span className="text-cyan-400 font-semibold">[{entry.module}]</span>
+                  </div>
+                  <div className="text-gray-300">{entry.action}</div>
+                </div>
+              )) || (
+                <div className="text-gray-400 text-center py-8">
+                  Process some text to see the log stream.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* 히스토리 차트 */}
+        {history.length > 0 && (
+          <div className="bg-white/5 backdrop-blur-lg rounded-2xl p-6 mt-6">
+            <h3 className="text-xl font-semibold mb-4 flex items-center gap-2">
+              <Zap className="w-5 h-5 text-yellow-400" />
+              Metrics History
+            </h3>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              <div>
+                <h4 className="text-sm font-medium text-gray-400 mb-2">CHI & ECR Trends</h4>
+                <ResponsiveContainer width="100%" height={200}>
+                  <LineChart data={history.slice(-10)}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                    <XAxis 
+                      dataKey="timestamp" 
+                      tickFormatter={(ts) => new Date(ts).toLocaleTimeString().slice(0,5)}
+                      stroke="#9CA3AF"
+                    />
+                    <YAxis stroke="#9CA3AF" />
+                    <Tooltip 
+                      contentStyle={{ 
+                        backgroundColor: 'rgba(0,0,0,0.8)', 
+                        border: '1px solid rgba(255,255,255,0.2)',
+                        borderRadius: '8px'
+                      }}
+                    />
+                    <Line type="monotone" dataKey="chi" stroke="#06D6A0" strokeWidth={2} />
+                    <Line type="monotone" dataKey="ecr" stroke="#FFD166" strokeWidth={2} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+              
+              <div>
+                <h4 className="text-sm font-medium text-gray-400 mb-2">ΔS & ΔR Distribution</h4>
+                <ResponsiveContainer width="100%" height={200}>
+                  <BarChart data={history.slice(-10)}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                    <XAxis 
+                      dataKey="timestamp" 
+                      tickFormatter={(ts) => new Date(ts).toLocaleTimeString().slice(0,5)}
+                      stroke="#9CA3AF"
+                    />
+                    <YAxis stroke="#9CA3AF" />
+                    <Tooltip 
+                      contentStyle={{ 
+                        backgroundColor: 'rgba(0,0,0,0.8)', 
+                        border: '1px solid rgba(255,255,255,0.2)',
+                        borderRadius: '8px'
+                      }}
+                    />
+                    <Bar dataKey="delta_s" fill="#EF476F" />
+                    <Bar dataKey="delta_r" fill="#118AB2" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default AstraeusDemo;
