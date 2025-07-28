@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+import sys
+import argparse
+import pandas as pd
+import numpy as np
+import matplotlib
+# Use non-interactive backend for server environments
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import requests
+import pulp
+from requests.adapters import HTTPAdapter
+from requests.exceptions import HTTPError, ConnectionError, Timeout
+from urllib3.util.retry import Retry
+
+# --- Configuration ---
+WEATHER_API_URL = "https://api.openweathermap.org/data/2.5/forecast"
+DEFAULT_LOCATION = (37.5665, 126.9780)  # Seoul (lat, lon)
+
+# Prepare a requests session with retries
+_SESSION = requests.Session()
+_RETRIES = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+)
+_SESSION.mount("https://", HTTPAdapter(max_retries=_RETRIES))
+
+# --- Data Loading & Preprocessing ---
+def load_historical_data(wind_csv: str, demand_csv: str) -> pd.DataFrame:
+    """
+    Load and join historical wind and demand CSV files.
+    Raises FileNotFoundError or ValueError on invalid input.
+    """
+    try:
+        wind = pd.read_csv(wind_csv, parse_dates=['timestamp']).set_index('timestamp')
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Wind CSV not found: {wind_csv}")
+    try:
+        dem = pd.read_csv(demand_csv, parse_dates=['timestamp']).set_index('timestamp')
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Demand CSV not found: {demand_csv}")
+    df = wind.join(dem, how='inner')
+    if 'wind' not in df.columns or 'demand' not in df.columns:
+        raise ValueError("Historical data must contain 'wind' and 'demand' columns.")
+    df = df[~df.index.duplicated(keep='first')]
+    if df.empty:
+        raise ValueError("No overlapping timestamps after join; check input CSVs.")
+    return df
+
+# --- Fetch Weather Forecast ---
+def fetch_weather_forecast(api_key: str,
+                           location: tuple = None,
+                           hours_ahead: int = 24) -> pd.DataFrame:
+    """
+    Fetch hourly weather forecast and return DataFrame with 'wind_speed' and 'temp'.
+    """
+    if not api_key:
+        raise RuntimeError("API key for weather not provided. Use --api-key or set WEATHER_API_KEY.")
+    lat, lon = location or DEFAULT_LOCATION
+    params = {'lat': lat, 'lon': lon, 'appid': api_key, 'units': 'metric'}
+    try:
+        resp = _SESSION.get(WEATHER_API_URL, params=params, timeout=10)
+        resp.raise_for_status()
+    except (HTTPError, ConnectionError, Timeout) as e:
+        raise RuntimeError(f"Failed to fetch weather data: {e}")
+    data = resp.json().get('list')
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected weather API response format.")
+    records = []
+    for entry in data[:hours_ahead]:
+        ts = pd.to_datetime(entry.get('dt', None), unit='s', errors='coerce')
+        ws = entry.get('wind', {}).get('speed')
+        temp = entry.get('main', {}).get('temp')
+        if pd.isna(ts) or ws is None or temp is None:
+            continue
+        try:
+            ws = float(ws)
+            temp = float(temp)
+        except (TypeError, ValueError):
+            continue
+        records.append({'timestamp': ts, 'wind_speed': ws, 'temp': temp})
+    df = pd.DataFrame.from_records(records)
+    if df.empty:
+        raise RuntimeError("Weather forecast returned no valid data.")
+    df = df[~df['timestamp'].duplicated(keep='first')]
+    return df.set_index('timestamp')
+
+# --- Wind Forecasting with Improved Cubic Model ---
+def forecast_wind_with_weather(hist_df: pd.DataFrame,
+                               api_key: str,
+                               hours_ahead: int = 24) -> pd.Series:
+    """
+    Forecast wind power using a cubic relation to wind speed.
+    Raises TypeError or ValueError on invalid input.
+
+    Uses: wind_power ≈ a*(wind_speed^3) + b
+    """
+    if not isinstance(hist_df, pd.DataFrame):
+        raise TypeError("hist_df must be a pandas DataFrame.")
+    if 'wind' not in hist_df.columns:
+        raise ValueError("Historical DataFrame must contain a 'wind' column.")
+    hist_df = hist_df[~hist_df.index.duplicated(keep='first')]
+    if hist_df.empty:
+        raise ValueError("Historical DataFrame is empty after removing duplicates.")
+    # Prepare training data
+    train = hist_df[['wind']].copy()
+    train['wind_speed'] = train['wind'].rolling(3, min_periods=1).mean()
+    train['ws_cubed'] = train['wind_speed'] ** 3
+    # Fit linear model on cubic wind speed
+    try:
+        coeff = np.polyfit(train['ws_cubed'], train['wind'], deg=1)
+    except Exception as e:
+        raise RuntimeError(f"Failed to fit cubic model: {e}")
+    # Fetch forecast and apply model
+    weather_fc = fetch_weather_forecast(api_key, DEFAULT_LOCATION, hours_ahead)
+    if 'wind_speed' not in weather_fc.columns:
+        raise RuntimeError("Weather forecast DataFrame missing 'wind_speed' column.")
+    ws3 = weather_fc['wind_speed'] ** 3
+    preds = coeff[0] * ws3 + coeff[1]
+    return preds.clip(lower=0)
+
+# --- Dispatch Optimization ---
+# ... (remaining code unchanged)
