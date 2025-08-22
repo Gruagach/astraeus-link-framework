@@ -1,0 +1,304 @@
+"""
+ψ‑log Concept Library (Python) v0.2 — 기록 방식 데모 (버그 픽스 + 테스트 추가)
+
+변경 요약
+  • [FIX] 비ASCII 문자열을 bytes literal로 해시하던 부분 수정 → 모든 입력을 UTF‑8로 안전 인코딩.
+  • [ADD] 단위 테스트 모음 추가(sha256_hex 유니코드 처리, 레닥션, 해시체인, JSONL 싱크, 컨텍스트 다이제스트).
+  • [KEEP] 기존 데모 흐름/출력 형식은 유지.
+
+실행
+  - 데모:  $ python psi_log_lib.py
+  - 테스트: $ python psi_log_lib.py --test
+
+주의
+  - 교육용 데모입니다. 제품 환경에서는 키 관리/서명(HMAC), 보존/삭제 정책, 접근제어(RBAC/ABAC), 재시도 큐 등을 추가하세요.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, asdict, field
+from typing import Any, Dict, List, Optional
+import hashlib, json, os, re, time, uuid, datetime, sys, tempfile, shutil
+
+# ============== 유틸 ==============
+
+def sha256_hex(data: Any, *, encoding: str = "utf-8") -> str:
+    """입력을 UTF-8로 안전 인코딩해 SHA-256 hexdigest 반환.
+    - str  -> UTF-8 인코딩
+    - bytes-> 그대로
+    - 그외 -> JSON 직렬화 후 UTF-8 인코딩
+    """
+    if isinstance(data, str):
+        buf = data.encode(encoding)
+    elif isinstance(data, (bytes, bytearray)):
+        buf = bytes(data)
+    else:
+        buf = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode(encoding)
+    h = hashlib.sha256(); h.update(buf)
+    return h.hexdigest()
+
+def now_iso() -> str:
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+# ============== 데이터 모델 ==============
+@dataclass
+class PsiLogRecord:
+    # 시각/식별
+    ts: str
+    event: str                      # "decision" | "iteration" | "incident" | "summary"
+    log_id: str
+
+    # 핵심 지표(0..1 범위 권고)
+    chi: Optional[float] = None
+    ecr: Optional[float] = None
+    delta_s: Optional[float] = None
+    delta_r: Optional[float] = None
+
+    # 컨텍스트/결정
+    route: Optional[str] = None       # ER 라우트
+    mode: Optional[str] = None        # Kernel 모드(EXPLORE/…)
+    acs_level: Optional[str] = None   # L0/L1/L2
+    reasons: List[str] = field(default_factory=list)
+
+    # 세계/루프/커널 메타
+    frame_divergence: Optional[float] = None
+    novelty: Optional[float] = None
+    sigma: Optional[float] = None
+    delta_s_grad: Optional[float] = None
+    kernel_T: Optional[float] = None
+    kernel_A: Optional[float] = None
+    loop_iter: Optional[int] = None
+
+    # 프라이버시/콘텐츠 다이제스트(원문 미보관)
+    redactions: Optional[int] = None
+    redaction_digest: Optional[str] = None
+    prompt_digest: Optional[str] = None
+    final_digest: Optional[str] = None
+
+    # 거버넌스/감사
+    audit_id: Optional[str] = None
+    policy_tag: Optional[str] = None
+    raci_role: Optional[str] = None
+    accountability_trace: Optional[str] = None
+
+    # 해시 체인(무결성)
+    hash_prev: Optional[str] = None
+    hash_this: Optional[str] = None
+
+    # 가변 공간(필요 시 확장)
+    extra: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        # None 제거로 전송량/노이즈 축소
+        return {k: v for k, v in d.items() if v is not None and v != [] and v != {}}
+
+# ============== 구성 ==============
+@dataclass
+class PsiLogConfig:
+    app: str = "astraeus.demo"
+    module: str = "psi-log"
+    file_path: str = "./out/psi_log_demo.jsonl"
+    canary: bool = False
+
+# ============== 프라이버시 레닥션 ==============
+class Redactor:
+    EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    PHONE = re.compile(r"\b\+?[0-9][0-9\-\s]{7,}[0-9]\b")
+
+    def redact(self, text: str) -> Dict[str, Any]:
+        if not text:
+            return {"text": text, "redactions": 0, "digest": None}
+        redactions = 0
+        def _sub(match: re.Match) -> str:
+            nonlocal redactions
+            redactions += 1
+            h = sha256_hex(match.group(0))[:8]
+            return f"[REDACTED:{h}]"
+        red_text = self.EMAIL.sub(_sub, text)
+        red_text = self.PHONE.sub(_sub, red_text)
+        digest = sha256_hex(text) if redactions else None
+        return {"text": red_text, "redactions": redactions, "digest": digest}
+
+# ============== 해시 체인 ==============
+class HashChain:
+    def __init__(self, genesis: Optional[str] = None):
+        self.prev = genesis or "0" * 64
+    def link(self, payload_json: str) -> Dict[str, str]:
+        h = sha256_hex(self.prev + payload_json)
+        prev = self.prev
+        self.prev = h
+        return {"hash_prev": prev, "hash_this": h}
+
+# ============== 싱크 인터페이스/구현 ==============
+class Sink:
+    def write(self, record: PsiLogRecord) -> None:
+        raise NotImplementedError
+
+class ConsoleSink(Sink):
+    def write(self, record: PsiLogRecord) -> None:
+        print(json.dumps(record.to_dict(), ensure_ascii=False))
+
+class JSONLinesSink(Sink):
+    def __init__(self, path: str):
+        self.path = path
+        dirn = os.path.dirname(path)
+        if dirn:
+            os.makedirs(dirn, exist_ok=True)
+    def write(self, record: PsiLogRecord) -> None:
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+
+# ============== 로거 ==============
+class PsiLogger:
+    def __init__(self, cfg: PsiLogConfig, sinks: List[Sink]):
+        self.cfg = cfg
+        self.sinks = sinks
+        self.redactor = Redactor()
+        self.chain = HashChain()
+
+    def log(self,
+            event: str,
+            metrics: Dict[str, Any],
+            decision: Dict[str, Any],
+            content_text: Optional[str] = None,
+            context: Optional[Dict[str, Any]] = None,
+            governance: Optional[Dict[str, Any]] = None,
+            extra: Optional[Dict[str, Any]] = None) -> PsiLogRecord:
+        # 1) 콘텐츠 레닥션·다이제스트
+        red = self.redactor.redact(content_text or "")
+        # 2) 레코드 조립
+        rec = PsiLogRecord(
+            ts=now_iso(),
+            event=event,
+            log_id=str(uuid.uuid4()),
+            chi=metrics.get("chi"),
+            ecr=metrics.get("ecr"),
+            delta_s=metrics.get("delta_s"),
+            delta_r=metrics.get("delta_r"),
+            route=decision.get("route"),
+            mode=decision.get("mode"),
+            acs_level=decision.get("acs_level"),
+            reasons=decision.get("reasons", []),
+            frame_divergence=metrics.get("frame_divergence"),
+            novelty=metrics.get("novelty"),
+            sigma=metrics.get("sigma"),
+            delta_s_grad=metrics.get("delta_s_grad"),
+            kernel_T=decision.get("kernel_T"),
+            kernel_A=decision.get("kernel_A"),
+            loop_iter=decision.get("loop_iter"),
+            redactions=red["redactions"],
+            redaction_digest=red["digest"],
+            prompt_digest=(context or {}).get("prompt_digest"),
+            final_digest=(context or {}).get("final_digest"),
+            audit_id=(governance or {}).get("audit_id"),
+            policy_tag=(governance or {}).get("policy_tag"),
+            raci_role=(governance or {}).get("raci_role"),
+            accountability_trace=(governance or {}).get("accountability_trace"),
+            extra=extra or {},
+        )
+        # 3) 해시 체인 (hash_prev/hash_this는 payload에서 제외)
+        payload = json.dumps(rec.to_dict(), ensure_ascii=False, separators=(",", ":"))
+        link = self.chain.link(payload)
+        rec.hash_prev, rec.hash_this = link["hash_prev"], link["hash_this"]
+        # 4) 싱크로 전송
+        for s in self.sinks:
+            s.write(rec)
+        return rec
+
+# ============== 데모 ==============
+
+def demo_run() -> None:
+    cfg = PsiLogConfig(file_path="./out/psi_log_demo.jsonl", canary=True)
+    sinks: List[Sink] = [ConsoleSink(), JSONLinesSink(cfg.file_path)]
+    logger = PsiLogger(cfg, sinks)
+
+    # 가상 콘텐츠(레닥션 테스트용 이메일 포함)
+    content = "문의: mars@colony.example 로 연락해주세요. 화성 온실 제약을 준수해야 합니다."
+
+    # 첫 의사결정 로그
+    rec1 = logger.log(
+        event="decision",
+        metrics={"chi":0.86, "ecr":0.94, "delta_s":0.05, "delta_r":0.028, "frame_divergence":0.31, "novelty":0.66},
+        decision={"route":"STANDARD", "mode":"GUARDED", "acs_level":"L1", "reasons":["CHI<0.90"], "kernel_T":0.79, "kernel_A":0.55},
+        content_text=content,
+        context={"prompt_digest": sha256_hex("지금 화성 식민지에 식량을 공급하려면?"), "final_digest": None},
+        governance={"audit_id":"aud-001", "policy_tag":"P-ethics-1.2", "raci_role":"owner:engineer"},
+        extra={"app": cfg.app, "module": cfg.module, "canary": cfg.canary}
+    )
+
+    time.sleep(0.2)
+
+    # 루프 1회 개선 후 로그
+    rec2 = logger.log(
+        event="iteration",
+        metrics={"chi":0.92, "ecr":0.96, "delta_s":0.03, "delta_r":0.020},
+        decision={"route":"STANDARD", "mode":"STANDARD", "acs_level":"L0", "reasons":["targets_met"], "kernel_T":0.86, "kernel_A":0.66, "loop_iter":1},
+        content_text="논리 보강 및 안전 가이드라인 반영 완료.",
+        context={"prompt_digest": rec1.prompt_digest, "final_digest": sha256_hex("최종안 v1")},
+        governance={"audit_id":"aud-001", "policy_tag":"P-ethics-1.2", "raci_role":"owner:engineer"},
+        extra={"app": cfg.app, "module": cfg.module, "canary": cfg.canary}
+    )
+
+    print("\n[info] JSONL 파일:", os.path.abspath(cfg.file_path))
+    print("[info] 체인 해시(prev→this):", rec1.hash_this, "→", rec2.hash_this)
+
+# ============== 테스트 ==============
+
+def run_tests() -> None:
+    print("[tests] 시작")
+
+    # T1: sha256_hex 유니코드 처리
+    s = "한글 해시 테스트"
+    expected = hashlib.sha256(s.encode("utf-8")).hexdigest()
+    assert sha256_hex(s) == expected, "sha256_hex가 유니코드 문자열을 올바르게 처리해야 합니다."
+
+    # T2: 레닥션(이메일/전화)
+    red = Redactor().redact("연락: a@b.co, +82 10-1234-5678")
+    assert red["redactions"] >= 1 and "REDACTED" in red["text"], "레닥션이 최소 1건 이상 수행되어야 합니다."
+    assert red["digest"], "레닥션이 발생하면 digest가 기록되어야 합니다."
+
+    # T3: 해시체인 연결
+    chain = HashChain()
+    l1 = chain.link("payload1")
+    l2 = chain.link("payload2")
+    assert l1["hash_this"] == l2["hash_prev"] and l1["hash_this"] != l2["hash_this"], "해시체인이 올바르게 연결되어야 합니다."
+
+    # T4: JSONL 싱크/로깅 및 컨텍스트 다이제스트(유니코드)
+    tmpdir = tempfile.mkdtemp(prefix="psi_log_test_")
+    try:
+        path = os.path.join(tmpdir, "log.jsonl")
+        logger = PsiLogger(PsiLogConfig(file_path=path), [JSONLinesSink(path)])
+        rec1 = logger.log(
+            event="decision",
+            metrics={"chi":0.9, "ecr":0.95, "delta_s":0.04, "delta_r":0.02},
+            decision={"route":"STANDARD", "mode":"STANDARD", "acs_level":"L0", "reasons":["ok"], "kernel_T":0.85, "kernel_A":0.65},
+            content_text="메일: x@y.z",  # 레닥션
+            context={"prompt_digest": sha256_hex("테스트 프롬프트"), "final_digest": None},
+            governance={"audit_id":"aud-test", "policy_tag":"P-test", "raci_role":"owner"},
+            extra={"k":"v"}
+        )
+        rec2 = logger.log(
+            event="iteration",
+            metrics={"chi":0.92, "ecr":0.96, "delta_s":0.03, "delta_r":0.019},
+            decision={"route":"STANDARD", "mode":"STANDARD", "acs_level":"L0", "reasons":["improved"], "kernel_T":0.87, "kernel_A":0.67, "loop_iter":1},
+            content_text="수정 반영",
+            context={"prompt_digest": rec1.prompt_digest, "final_digest": sha256_hex("최종안 테스트")},
+            governance={"audit_id":"aud-test", "policy_tag":"P-test", "raci_role":"owner"},
+            extra={}
+        )
+        # 파일 라인 수 확인
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [json.loads(x) for x in f.read().strip().splitlines()]
+        assert len(lines) == 2, "JSONL 파일에는 두 줄이 기록되어야 합니다."
+        # 해시체인 일치 확인
+        assert lines[0]["hash_this"] == lines[1]["hash_prev"], "파일 내 해시체인 연결이 일치해야 합니다."
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print("[tests] 모든 테스트 통과 ✅")
+
+# ============== 엔트리 포인트 ==============
+if __name__ == "__main__":
+    if "--test" in sys.argv:
+        run_tests()
+    else:
+        demo_run()
