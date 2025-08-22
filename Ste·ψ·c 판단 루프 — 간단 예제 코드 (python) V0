@@ -1,0 +1,236 @@
+"""
+STE·Ψ·C + 판단 루프(Λ-Loop 라이트) — 간단 예제 코드 v0.1
+
+목적:
+  - S·T·E(공간·시간·에너지) 컨텍스트, Ψ(윤리/불확실성), C(인과)를 담은
+    미니 세계모델 + 간단 ψ-커널 + 판단 루프를 한 파일로 시연합니다.
+  - 외부 의존성 없이 실행 가능(표준 라이브러리만 사용).
+
+실행:
+  $ python ste_psi_c_loop_demo.py
+
+출력:
+  - 최종 응답과 메트릭(ΔR/ΔS/CHI/ECR), 신뢰/자율 모드, 루프 트레이스 JSON
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Any
+import math, json, time, random
+
+# ----------------------------- 유틸 -----------------------------
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+random.seed(42)
+
+# --------------------------- STE 컨텍스트 ---------------------------
+@dataclass
+class STEContext:
+    space: str            # 예: "mars.colony" / "earth.agri"
+    time: str             # ISO 시각 문자열
+    energy_budget: float  # 0..1 (계산/탐색 예산)
+    sensitivity: str      # "low" | "medium" | "high" | "critical"
+
+# -------------------------- Ψ 메트릭/결정 --------------------------
+@dataclass
+class PsiMetrics:
+    ecr: float      # 윤리/정책 준수(0..1)
+    chi: float      # 인과 정합성(0..1)
+    delta_s: float  # 불확실성(+이면 불확실 ↑)
+    delta_r: float  # 위험(+이면 위험 ↑)
+
+@dataclass
+class PsiTrustDecision:
+    T: float
+    A: float
+    mode: str        # EXPLORE | STANDARD | GUARDED | FREEZE
+    params: Dict[str, Any]
+
+# --------------------------- 세계모델(SEC) ---------------------------
+class WorldModel:
+    """매우 단순화된 S·T·E·C 통합 월드 모델(사실/제약/인과경로 반환)."""
+    def activate(self, prompt: str, ste: STEContext) -> Dict[str, Any]:
+        facts: List[str] = []
+        constraints: List[str] = []
+        causal_paths: List[List[str]] = []
+        unc_bound = 0.2
+
+        if "화성" in prompt or "Mars" in prompt:
+            facts = [
+                "화성 대기압은 지구의 약 0.6% 수준",
+                "평균 기온은 영하, 온실/차압 구조 필요",
+                "물은 얼음/수증기 형태로 존재, 재순환 시스템 필요",
+                "식물재배엔 조명/열/CO2 보정 필수",
+            ]
+            constraints = [
+                "지하 또는 실내 온실 사용",
+                "수경/수분양액 재순환",
+                "차압/밀폐/복합에너지 비용 고려",
+            ]
+            causal_paths = [["저기압→증발 손실↑→수분 재순환 필요"], ["저온→난방 에너지↑→재생에너지 배치"]]
+            unc_bound = 0.12
+        else:
+            facts = ["일반 농업: 토양/수분/광량/온도/병해 관리의 상호작용"]
+            constraints = ["현지 기후/토양 조건에 적합한 품종"]
+            causal_paths = [["기후→생육→수확량"]]
+            unc_bound = 0.18
+
+        return {
+            "facts": facts,
+            "constraints": constraints,
+            "causal_paths": causal_paths,
+            "uncertainty_bound": unc_bound,
+        }
+
+# ------------------------------ C(인과) ------------------------------
+class CausalChecker:
+    """답변에 세계모델의 핵심 사실/제약을 얼마나 반영했는지로 CHI를 근사."""
+    def score_chi(self, answer: str, facts: List[str], constraints: List[str]) -> float:
+        anchors = 0
+        for f in facts[:3]:
+            if any(tok in answer for tok in f.split()[:2]):
+                anchors += 1
+        for c in constraints[:2]:
+            if any(tok in answer for tok in c.split()[:2]):
+                anchors += 1
+        base = anchors / max(1, (3 + 2))
+        # 상충 키워드가 있으면 패널티(예: 화성 대기압이 높다는 잘못된 진술)
+        contradictions = ["화성 대기압은 지구보다 높", "대기압이 지구와 비슷"]
+        penal = any(k in answer for k in contradictions)
+        chi = clamp(base - (0.3 if penal else 0.0), 0.0, 1.0)
+        return chi
+
+# --------------------------- Ψ(윤리/불확실) ---------------------------
+class PsiCritics:
+    def ecr(self, answer: str, sensitivity: str) -> float:
+        banned = ["무단 침입", "폭력", "불법"]
+        hit = any(b in answer for b in banned)
+        base = 0.97 if not hit else 0.7
+        # 민감도가 높을수록 기준 상향(보수화)
+        mult = {"low": 1.0, "medium": 0.98, "high": 0.95, "critical": 0.90}.get(sensitivity, 0.98)
+        return clamp(base * mult, 0.0, 1.0)
+
+    def delta_s(self, answer: str, unc_bound: float) -> float:
+        # 근거/제약/불확실성 언급이 많을수록 불확실성 표기가 좋아져 ΔS 감소
+        signals = sum(1 for k in ["근거", "제약", "불확실", "추정"] if k in answer)
+        return clamp(unc_bound - 0.02 * signals, 0.0, 0.5)
+
+    def delta_r(self, sensitivity: str, novelty: float, mode_hint: str = "STANDARD") -> float:
+        base = {"low": 0.01, "medium": 0.025, "high": 0.04, "critical": 0.06}.get(sensitivity, 0.025)
+        nudge = 0.015 * (novelty - 0.5)
+        if mode_hint == "GUARDED":
+            base += 0.005
+        return clamp(base + nudge, 0.0, 0.2)
+
+# --------------------------- ψ-Trust 커널 ---------------------------
+class PsiTrustKernel:
+    def decide(self, pm: PsiMetrics, sensitivity: str) -> PsiTrustDecision:
+        # 간단한 점수 집계 → T, A, Mode
+        x = (pm.ecr * 0.35) + (pm.chi * 0.35) + ((1 - pm.delta_r) * 0.2) + ((1 - pm.delta_s) * 0.1)
+        T = 1 / (1 + math.exp(-4 * (x - 0.5)))
+        base_A = {"low": 0.8, "medium": 0.65, "high": 0.45, "critical": 0.3}[sensitivity]
+        A = clamp(base_A * (T ** 1.1), 0.0, 1.0)
+        if T >= 0.90 and A >= 0.70:
+            mode = "EXPLORE"
+        elif T >= 0.80 and A >= 0.50:
+            mode = "STANDARD"
+        elif T >= 0.60:
+            mode = "GUARDED"
+        else:
+            mode = "FREEZE"
+        params = {
+            "temperature": {"EXPLORE": 0.7, "STANDARD": 0.5, "GUARDED": 0.3, "FREEZE": 0.2}[mode],
+            "lambda_iters": {"EXPLORE": 1, "STANDARD": 2, "GUARDED": 3, "FREEZE": 1}[mode],
+        }
+        return PsiTrustDecision(T=T, A=A, mode=mode, params=params)
+
+# --------------------------- 판단 루프(라이트) ---------------------------
+class JudgmentLoop:
+    def __init__(self):
+        self.world = WorldModel()
+        self.causal = CausalChecker()
+        self.psi = PsiCritics()
+        self.kernel = PsiTrustKernel()
+
+    def initial_draft(self, prompt: str, wm: Dict[str, Any]) -> str:
+        # 세계모델의 사실/제약을 일부 포함한 초안 생성(LLM 자리의 템플릿)
+        facts = " · ".join(wm["facts"][:2])
+        cons = " · ".join(wm["constraints"][:1])
+        draft = (
+            f"요약: 질문에 대한 1차 제안입니다.\n"
+            f"핵심 사실: {facts}.\n"
+            f"기본 제약: {cons}.\n"
+            f"제안: 지하 온실과 수경 재배를 결합하고, 에너지/수분 재순환을 최적화합니다."
+        )
+        return draft
+
+    def evaluate(self, answer: str, wm: Dict[str, Any], ste: STEContext, novelty: float, mode_hint: str) -> PsiMetrics:
+        chi = self.causal.score_chi(answer, wm["facts"], wm["constraints"])
+        ecr = self.psi.ecr(answer, ste.sensitivity)
+        ds = self.psi.delta_s(answer, wm["uncertainty_bound"])
+        dr = self.psi.delta_r(ste.sensitivity, novelty, mode_hint)
+        return PsiMetrics(ecr=ecr, chi=chi, delta_s=ds, delta_r=dr)
+
+    def refine(self, answer: str, wm: Dict[str, Any], pm: PsiMetrics) -> str:
+        refined = answer
+        if pm.chi < 0.90:
+            # 논리 보강: 세계모델 근거와 인과 경로를 추가
+            reasons = " ; ".join(wm["causal_paths"][0]) if wm["causal_paths"] else ""
+            refined += f"\n[논리 보강] 제약 준수 및 인과 연결: {reasons}"
+        if pm.ecr < 0.90:
+            # 표현 순화/주의문 추가
+            refined += "\n[윤리 보강] 민감 주제에 대한 안전 가이드라인을 준수하며, 위험한 세부 지시를 포함하지 않습니다."
+        if pm.delta_r > 0.03:
+            refined += "\n[안전 보강] 불확실/위험 요소가 있어 보수적 요약과 단계적 실험을 권합니다."
+        # 불확실성 명시
+        refined += "\n[불확실성 표기] 일부 수치/전략은 환경에 따라 달라질 수 있습니다."
+        return refined
+
+    def run(self, prompt: str, ste: STEContext) -> Dict[str, Any]:
+        wm = self.world.activate(prompt, ste)
+        novelty = 0.7 if "화성" in prompt else 0.5
+        draft = self.initial_draft(prompt, wm)
+
+        trace: List[Dict[str, Any]] = []
+        answer = draft
+        # 0차 평가(모드 힌트 없이 STANDARD 가정)
+        pm0 = self.evaluate(answer, wm, ste, novelty, mode_hint="STANDARD")
+        dec0 = self.kernel.decide(pm0, ste.sensitivity)
+
+        max_iters = dec0.params["lambda_iters"]
+        for it in range(max_iters):
+            pm = self.evaluate(answer, wm, ste, novelty, mode_hint=dec0.mode)
+            trace.append({
+                "iter": it,
+                "metrics": {"ecr": pm.ecr, "chi": pm.chi, "delta_s": pm.delta_s, "delta_r": pm.delta_r},
+                "mode": dec0.mode,
+            })
+            # 정지조건: ΔR≤0.03 & CHI/ECR≥0.90
+            if pm.delta_r <= 0.03 and pm.chi >= 0.90 and pm.ecr >= 0.90:
+                break
+            # 개선
+            answer = self.refine(answer, wm, pm)
+            # 모드 재결정
+            dec0 = self.kernel.decide(pm, ste.sensitivity)
+
+        final_pm = self.evaluate(answer, wm, ste, novelty, mode_hint=dec0.mode)
+        final_dec = self.kernel.decide(final_pm, ste.sensitivity)
+        return {
+            "user_query": prompt,
+            "ste": ste.__dict__,
+            "world_model": {k: wm[k] for k in ["facts", "constraints", "uncertainty_bound"]},
+            "final_answer": answer,
+            "psi_metrics": final_pm.__dict__,
+            "psi_trust": {"T": final_dec.T, "A": final_dec.A, "mode": final_dec.mode},
+            "trace": trace,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+
+# ------------------------------ 데모 ------------------------------
+if __name__ == "__main__":
+    ste = STEContext(space="mars.colony", time=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                     energy_budget=0.6, sensitivity="medium")
+    prompt = "지금 화성 식민지에 식량을 공급하려면 어떻게 해야 하나요?"
+    loop = JudgmentLoop()
+    result = loop.run(prompt, ste)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
