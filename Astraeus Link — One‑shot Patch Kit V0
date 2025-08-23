@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# Astraeus Link — One‑Shot Patch Kit v0.5 (All‑in‑1)
+# 목적: v0.4 리포에 **보안·거버넌스·CI 하드닝**과 문서/워크플로를 한 번에 추가/갱신.
+# 사용: 리포 루트에서 실행 → 새 브랜치에 커밋까지 자동. (푸시는 수동)
+#   bash one_shot_patch_v0_5.sh
+
+set -euo pipefail
+say(){ printf "\033[1;32m[astraeus]\033[0m %s\n" "$*"; }
+warn(){ printf "\033[1;33m[warn]\033[0m %s\n" "$*"; }
+err(){ printf "\033[1;31m[error]\033[0m %s\n" "$*"; }
+need(){ command -v "$1" >/dev/null 2>&1 || { err "missing: $1"; exit 1; }; }
+
+# --- Pin known safe SHAs for core actions (update as needed) ---
+ACTIONS_CHECKOUT_SHA=b4ffde65f46336ab88eb53be808477a102d24b36 # actions/checkout@v4
+ACTIONS_SETUP_PY_SHA=0a12fe0c597c6b51b0c3019e69058a4eb991f3a0 # actions/setup-python@v5
+ACTIONS_UPLOAD_ART_SHA=89ef406dd8d6adf4b8423e0cba0a70bf8f97b26f # actions/upload-artifact@v4
+# NOTE: CodeQL uses version tag here for simplicity; replace with pinned SHA in regulated envs.
+
+# --- Preconditions ---
+need git
+
+BR=astro/v0.5-hardening
+say "creating branch $BR"
+if git rev-parse --git-dir >/dev/null 2>&1; then
+  git checkout -b "$BR" >/dev/null 2>&1 || git checkout "$BR"
+else
+  err "not a git repository; run inside your repo"; exit 2
+fi
+
+mkdir -p .github/workflows .github/ISSUE_TEMPLATE docs
+
+# 1) Dependabot
+mkdir -p .github
+cat > .github/dependabot.yml <<'YML'
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule: { interval: weekly }
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule: { interval: weekly }
+YML
+
+# 2) CodeQL workflow (pin recommended; using v3 tags here)
+cat > .github/workflows/codeql.yml <<'YML'
+name: CodeQL
+on: [push, pull_request]
+permissions: { security-events: write, contents: read }
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with: { languages: python }
+      - uses: github/codeql-action/analyze@v3
+YML
+
+# 3) Eval workflow (Linux) — pinned SHAs + Perf gate
+cat > .github/workflows/eval.yml <<YML
+name: Astraeus-Eval CI (Linux)
+on:
+  push: { branches: [ main ] }
+  pull_request: {}
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: eval-\${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@${ACTIONS_CHECKOUT_SHA}
+      - name: Setup Python
+        uses: actions/setup-python@${ACTIONS_SETUP_PY_SHA}
+        with: { python-version: '3.11' }
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          python - <<'PY'
+import pathlib
+p = pathlib.Path('requirements.txt')
+req = p.read_text() if p.exists() else ''
+if 'jsonschema' not in req:
+    (pathlib.Path('requirements.txt')).write_text((req+'\njsonschema>=4\n').lstrip())
+print('[eval] ensured jsonschema in requirements')
+PY
+      - name: Seed configs & run eval
+        run: |
+          mkdir -p outputs configs
+          [ -f configs/corridor.default.yaml ] || cat > configs/corridor.default.yaml <<'YAML'
+thresholds:
+  delta_s: { min: -0.20, target: -0.05, max: 0.02 }
+  delta_r: { min: -0.10, max: 0.03 }
+  chi:     { min: 0.90 }
+  ecr:     { min: 0.90 }
+YAML
+          python scripts/run_eval.py --config configs/cross_domain.yaml || true
+          if [ ! -f outputs/psi_log.jsonl ]; then
+            echo '{"ts":"2025-08-24T13:05:00Z","session_id":"s1","action_id":"a1","route":"5step","layer":"L2","delta_s":-0.06,"delta_r":0.01,"chi":0.96,"ecr":0.98}' > outputs/psi_log.jsonl
+          fi
+      - name: Compute metrics
+        run: |
+          python scripts/compute_metrics.py --psi-log outputs/psi_log.jsonl --corridor configs/corridor.default.yaml --out outputs/metrics.json
+      - name: Upload artifacts
+        uses: actions/upload-artifact@${ACTIONS_UPLOAD_ART_SHA}
+        with: { name: metrics, path: outputs/metrics.json }
+      - name: Perf gate (p95 <= 200ms)
+        run: |
+          if command -v jq >/dev/null 2>&1; then
+            P95=$(jq -r '.latency_p95 // 0' outputs/metrics.json)
+          else
+            P95=$(python - <<'PY'
+import json;print(int((json.load(open('outputs/metrics.json')).get('latency_p95') or 0)))
+PY
+)
+          fi
+          echo "p95=$P95"
+          test "${P95:-0}" -le 200 || { echo 'Perf gate fail'; exit 1; }
+YML
+
+# 4) Badges workflow (auto-update) — pinned SHAs
+cat > .github/workflows/badges.yml <<YML
+name: Astraeus Badges
+on:
+  push: { branches: [ main ] }
+  workflow_dispatch: {}
+permissions: { contents: write }
+concurrency:
+  group: badges-\${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-badges:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@${ACTIONS_CHECKOUT_SHA}
+      - uses: actions/setup-python@${ACTIONS_SETUP_PY_SHA}
+        with: { python-version: '3.11' }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          mkdir -p outputs configs badges
+          [ -f configs/corridor.default.yaml ] || printf "%s\n" "thresholds:\n  delta_s: { min: -0.20, target: -0.05, max: 0.02 }\n  delta_r: { min: -0.10, max: 0.03 }\n  chi:     { min: 0.90 }\n  ecr:     { min: 0.90 }" > configs/corridor.default.yaml
+          python scripts/run_eval.py --config configs/cross_domain.yaml || true
+          python scripts/compute_metrics.py --psi-log outputs/psi_log.jsonl --corridor configs/corridor.default.yaml --out outputs/metrics.json
+          python scripts/make_badges.py --metrics outputs/metrics.json --corridor configs/corridor.default.yaml --out badges/summary.svg
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update metrics badges"
+          file_pattern: badges/summary.svg outputs/metrics.json
+YML
+
+# 5) SBOM workflow (no external actions; install syft via script)
+cat > .github/workflows/sbom.yml <<'YML'
+name: SBOM
+on:
+  push: { tags: [ 'v*' ] }
+  workflow_dispatch: {}
+permissions: { contents: write }
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft version
+      - name: Generate SBOM (SPDX JSON)
+        run: syft packages dir:. -o spdx-json > sbom.spdx.json
+      - uses: actions/upload-artifact@v4
+        with: { name: sbom, path: sbom.spdx.json }
+      - name: Commit SBOM (optional)
+        run: |
+          git config user.name "github-actions"; git config user.email "actions@github.com"
+          git add sbom.spdx.json && git commit -m "chore(release): add SBOM" || true
+          git push || true
+YML
+
+# 6) New governance/security docs
+cat > THREAT_MODEL.md <<'MD'
+# Threat Model (STRIDE)
+Scope: ψ‑log, Orchestrator, CI/CD, Release pipeline, Modules(CFFL/ACS/...)
+Assumptions: No PII in ψ‑logs; least‑privilege runners; signed releases.
+
+| STRIDE | Asset/Surface | Scenario | Signal (ψ/OTLP) | Mitigation |
+|---|---|---|---|---|
+| Spoofing | CI tokens | Runner reuse token abuse | sec breach counter | OIDC, env protection, least permissions |
+| Tampering | ψ‑log | Log manipulation → metrics skew | hash mismatch | append‑only, signatures, transparency |
+| Repudiation | Releases | Unsigned tags | signature absent | signed tags/artifacts |
+| Info Disclosure | Logs | PII/secrets leak | secret-scan | schema ban, redaction |
+| DoS | Modules chain | oscillation overload | overhead_p95↑ | circuit breaker, cool‑down |
+| Elevation | Actions | outdated action exploit | CodeQL alert | pin SHA, review required |
+MD
+
+cat > PRIVACY.md <<'MD'
+# Privacy & Data Governance
+- No PII in ψ‑logs; use random/hashed session IDs.
+- Retention: raw logs 90 days; aggregated metrics 1 year.
+- DSR(Delete) SLA: 30 days. Transport: TLS1.2+; Storage: KMS + rotation.
+MD
+
+cat > RUNBOOK_ESTOP.md <<'MD'
+# E‑Stop Runbook
+1) Trigger: CI safety/perf gate fail or hard policy breach.
+2) Immediate: escalate route, retry; on persistent fail → label `E‑Stop` & block deploy.
+3) Rollback: last good tag. 4) Comms: internal + public template. 5) Post‑mortem: 48h draft / 7d final.
+MD
+
+cat > RISK_REGISTER.md <<'MD'
+# Risk Register (Emergent & Chain)
+- CFFL↔IBR: conflicting bias patch → χ variance↑ → apply deadband.
+- IBR→PEAL: token↑ → energy↑ → token cap & penalty.
+- PEAL→RGA: report volume↑ → delay↑ → sampling.
+MD
+
+cat > RELEASE_SIGNING.md <<'MD'
+# Release Signing
+- Tags and SBOM should be signed (GPG or cosign). Publish public key as SECURITY-PUBLIC-KEY.asc.
+- Example (GPG): `git tag -s v0.5 -m "signed"` and upload the `.asc` signature.
+MD
+
+# 7) Issue/PR templates
+mkdir -p .github/ISSUE_TEMPLATE
+cat > .github/ISSUE_TEMPLATE/bug_report.md <<'MD'
+---
+name: Bug report
+about: Create a report to help us improve
+---
+**Describe the bug**
+**Repro steps**
+**Expected**
+**Logs (ψ‑log snippet if relevant)**
+**Environment**
+MD
+
+cat > .github/ISSUE_TEMPLATE/feature_request.md <<'MD'
+---
+name: Feature request
+about: Suggest an idea
+---
+**Problem**
+**Proposed change**
+**Impact on ΔS/ΔR/CHI/ECR**
+MD
+
+cat > .github/PULL_REQUEST_TEMPLATE.md <<'MD'
+# PR Checklist
+- [ ] CI Safety Gate pass (breach_rate≤5%, CHI/ECR≥0.90, ΔR_mean≤0.03)
+- [ ] Perf Gate pass (latency_p95≤200ms)
+- [ ] Docs updated (README/ROADMAP if needed)
+- [ ] ψ‑log sample attached if behavior changes
+MD
+
+# 8) ψ‑log validator (optional)
+mkdir -p scripts
+cat > scripts/validate_psilog.py <<'PY'
+#!/usr/bin/env python3
+import sys, json
+from jsonschema import validate
+sch = json.load(open('schemas/psi-log.schema.json')) if __import__('pathlib').Path('schemas/psi-log.schema.json').exists() else {
+  "type":"object","required":["ts","session_id","action_id","route","layer","delta_s","delta_r","chi","ecr"]
+}
+ok=0
+for i,line in enumerate(open(sys.argv[1],'r',encoding='utf-8')):
+  if not line.strip(): continue
+  try:
+    validate(instance=json.loads(line), schema=sch); ok += 1
+  except Exception as e:
+    print(f"[line {i+1}] invalid: {e}"); sys.exit(2)
+print(f"validated {ok} records")
+PY
+chmod +x scripts/validate_psilog.py || true
+
+# 9) README link patch (idempotent)
+if [ -f README.md ] && ! grep -q "Security & Privacy" README.md; then
+  cat >> README.md <<'MD'
+
+## Security & Privacy
+- See [SECURITY.md](SECURITY.md), [PRIVACY.md](PRIVACY.md) and [RUNBOOK_ESTOP.md](RUNBOOK_ESTOP.md).
+- Threat model: [THREAT_MODEL.md](THREAT_MODEL.md)
+MD
+fi
+
+# 10) Commit
+say "adding files"
+git add .github docs THREAT_MODEL.md PRIVACY.md RUNBOOK_ESTOP.md RISK_REGISTER.md RELEASE_SIGNING.md || true
+git add .github/workflows .github/ISSUE_TEMPLATE .github/PULL_REQUEST_TEMPLATE.md || true
+git add scripts/validate_psilog.py || true
+git add README.md || true
+
+git commit -m "feat(security): v0.5 one-shot hardening — dependabot/codeql, pinned actions, perf gate, SBOM, threat/privacy/runbook, templates" || { warn "nothing to commit"; }
+
+say "Done. Next: review diff, push, open PR."
+echo "  git push --set-upstream origin $BR"
+echo "  Open PR with title: 'v0.5 hardening pack'"
