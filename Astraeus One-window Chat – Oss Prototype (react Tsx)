@@ -1,0 +1,355 @@
+/*
+Astraeus One-Window Chat – OSS Prototype (React TSX)
+License: MIT
+
+▶ What this is
+- A single-file React prototype of a "one chat window" UI that logs ψ‑metrics, supports 3/5/7-step routing tags,
+  and exposes data-policy switches for Record/Context/Memory/Learning (A–D layers).
+- Ready to drop into a Next.js + Tailwind + shadcn/ui project.
+
+▶ Key ideas
+- UI is single-pane; internally we track route(3|5|7), tools used, ψ‑log {chi,ecr,delta_s,delta_r}, and ESTOP gate.
+- Right drawer shows artifacts/logs; footer has slash-commands.
+
+──────────────────────────────────────────────────────────────────────────*/
+
+import React, { useMemo, useRef, useState } from "react";
+import { Card, CardHeader, CardContent, CardFooter } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Slider } from "@/components/ui/slider";
+import { Separator } from "@/components/ui/separator";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Tooltip, TooltipProvider, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
+import { BookOpen, ShieldCheck, Activity, Zap, Cpu, Lock, GitBranch, Gauge, TerminalSquare, FileJson, MessageSquare, PanelRightOpen, PanelRightClose, BotMessageSquare, Play } from "lucide-react";
+
+// ───────────────────────────────── Types ─────────────────────────────────
+export type PsiLog = {
+  chi: number;    // Causal Harmony Index (0..1)
+  ecr: number;    // Ethics/Policy Compliance Rate (0..1)
+  delta_s: number;// Entropy change (− good / + bad)
+  delta_r: number;// Risk change (≤ +0.03 target)
+  route?: 3 | 5 | 7;
+  tools?: string[];
+  duration_ms?: number;
+  timestamp?: string;
+};
+
+export type Message = {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  artifacts?: { type: "image" | "doc" | "json" | "plot"; label: string; href?: string; payload?: any }[];
+  psi: PsiLog;
+};
+
+export type DataPolicy = {
+  record_transcript: boolean; // A
+  record_psilog: boolean;     // A
+  context_reuse: "off" | "project" | "global"; // B
+  pii_redaction: boolean;     // B
+  memory_enabled: boolean;    // C
+  memory_scope: ("project" | "global")[];      // C
+  training_enabled: boolean;  // D
+  dp_epsilon?: number | null; // D - differential privacy (optional)
+  retention_days: { transcript: number; psilog: number; rag_index: number; memory: number };
+};
+
+// ─────────────────────────────── Utilities ──────────────────────────────
+function estopGate(psi: PsiLog): { ok: boolean; reason?: string } {
+  if (psi.ecr < 1.0) return { ok: false, reason: "ECR<1.0 (policy)" };
+  if (psi.chi < 0.9) return { ok: false, reason: "CHI<0.90 (harmony)" };
+  if (psi.delta_r > 0.03) return { ok: false, reason: "ΔR>0.03 (risk)" };
+  return { ok: true };
+}
+
+function fmt(n: number, d = 2) {
+  return (Math.round(n * 10 ** d) / 10 ** d).toFixed(d);
+}
+
+function nowISO() {
+  return new Date().toISOString();
+}
+
+// Demo spatial util – minimal projection reconstruction (from earlier discussion)
+export function reconstructMin(top: number[][], front: number[], right: number[]): number[][] {
+  const H = top.map((row, y) => row.map((t, x) => (t ? Math.min(front[x], right[y]) : 0)));
+  // quick validation (throw if inconsistent)
+  const colMax = (x: number) => Math.max(...H.map((r) => r[x]));
+  const rowMax = (y: number) => Math.max(...H[y]);
+  for (let x = 0; x < front.length; x++) if (front[x] !== colMax(x)) throw new Error("Front mismatch at col " + x);
+  for (let y = 0; y < right.length; y++) if (right[y] !== rowMax(y)) throw new Error("Right mismatch at row " + y);
+  return H;
+}
+
+// Score corridors (toy) combining −ΔR, CHI, −energy, −ΔS
+function scoreCorridor(psi: PsiLog, energyCost = 0.2, w = { r: 1, c: 1, e: 0.5, s: 0.5 }) {
+  const s = -psi.delta_r * w.r + psi.chi * w.c - energyCost * w.e - Math.max(psi.delta_s, 0) * w.s;
+  return s;
+}
+
+// ─────────────────────────────── Demo Seeds ─────────────────────────────
+const SEED_MESSAGES: Message[] = [
+  {
+    id: "m1",
+    role: "user",
+    text: "자율주행 L4에서 RSS·TTC·DRAC 비교하고, L자 투영 복원 예시도 보여줘.",
+    psi: { chi: 0.92, ecr: 1.0, delta_s: -0.03, delta_r: 0.01, route: 7, tools: ["python", "canvas"], duration_ms: 820, timestamp: nowISO() },
+  },
+  {
+    id: "m2",
+    role: "assistant",
+    text: "RSS는 안전 거리의 하한, TTC/DRAC은 위험 지표입니다. 투영 복원은 H[y,x]=Top[y,x]*min(Front[x],Right[y]).",
+    artifacts: [
+      { type: "json", label: "ψ-log", payload: { chi: 0.94, ecr: 1.0, delta_s: -0.06, delta_r: 0.01 } },
+      { type: "doc", label: "퀵스타트 문서", href: "canvas://Astraeus S·T·E·Ψ·C — 자율주행 공간·인지 퀵스타트 (v1.0)" },
+    ],
+    psi: { chi: 0.94, ecr: 1.0, delta_s: -0.06, delta_r: 0.01, route: 7, tools: ["python"], duration_ms: 1560, timestamp: nowISO() },
+  },
+];
+
+const DEFAULT_POLICY: DataPolicy = {
+  record_transcript: true,
+  record_psilog: true,
+  context_reuse: "project",
+  pii_redaction: true,
+  memory_enabled: false,
+  memory_scope: ["project"],
+  training_enabled: false,
+  dp_epsilon: null,
+  retention_days: { transcript: 90, psilog: 365, rag_index: 180, memory: 3650 },
+};
+
+// ─────────────────────────────── UI Components ──────────────────────────
+const Chip: React.FC<{ children: React.ReactNode; active?: boolean; onClick?: () => void }> = ({ children, active, onClick }) => (
+  <button onClick={onClick} className={`px-3 py-1 rounded-full text-xs border ${active ? "bg-black text-white" : "bg-white"}`}>{children}</button>
+);
+
+const PsiBadge: React.FC<{ psi: PsiLog }> = ({ psi }) => {
+  const gate = estopGate(psi);
+  return (
+    <div className="flex items-center gap-1 flex-wrap">
+      <Badge variant="secondary">χ {fmt(psi.chi)}</Badge>
+      <Badge variant="secondary">ECR {fmt(psi.ecr)}</Badge>
+      <Badge variant="secondary">ΔS {fmt(psi.delta_s)}</Badge>
+      <Badge variant="secondary">ΔR {fmt(psi.delta_r)}</Badge>
+      <Badge>{psi.route}‑step</Badge>
+      {psi.tools?.map((t) => (
+        <Badge key={t} variant="outline">{t}</Badge>
+      ))}
+      {!gate.ok ? <Badge className="bg-red-600 text-white">ESTOP: {gate.reason}</Badge> : <Badge className="bg-emerald-600 text-white">SAFE</Badge>}
+    </div>
+  );
+};
+
+const MessageCard: React.FC<{ m: Message }> = ({ m }) => (
+  <Card className="shadow-sm">
+    <CardHeader className="pb-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          {m.role === "assistant" ? <BotMessageSquare size={16}/> : <MessageSquare size={16}/>}<span className="text-sm font-medium">{m.role}</span>
+        </div>
+        <div className="text-xs text-muted-foreground">{new Date(m.psi.timestamp ?? Date.now()).toLocaleString()}</div>
+      </div>
+    </CardHeader>
+    <CardContent className="pt-0 space-y-3">
+      <div className="whitespace-pre-wrap text-sm leading-6">{m.text}</div>
+      <PsiBadge psi={m.psi} />
+      {m.artifacts && m.artifacts.length>0 && (
+        <div className="flex flex-wrap gap-2">
+          {m.artifacts.map((a, i) => (
+            <Badge key={i} variant="outline" className="cursor-pointer" title={a.href || JSON.stringify(a.payload)}>
+              {a.type.toUpperCase()} · {a.label}
+            </Badge>
+          ))}
+        </div>
+      )}
+    </CardContent>
+  </Card>
+);
+
+const PolicyPanel: React.FC<{ policy: DataPolicy; onChange: (p: DataPolicy) => void }> = ({ policy, onChange }) => {
+  return (
+    <Card className="shadow-sm">
+      <CardHeader className="pb-2"><div className="flex items-center gap-2"><ShieldCheck size={16}/>데이터 정책 스위치</div></CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex items-center justify-between"><span>기록(Transcript)</span><Switch checked={policy.record_transcript} onCheckedChange={(v)=>onChange({...policy, record_transcript: v})}/></div>
+        <div className="flex items-center justify-between"><span>ψ‑log 기록</span><Switch checked={policy.record_psilog} onCheckedChange={(v)=>onChange({...policy, record_psilog: v})}/></div>
+        <Separator/>
+        <div className="flex items-center justify-between"><span>문맥 재사용</span>
+          <div className="flex gap-2">
+            {["off","project","global"].map(k=> (
+              <Chip key={k} active={policy.context_reuse===k} onClick={()=>onChange({...policy, context_reuse: k as any})}>{k}</Chip>
+            ))}
+          </div>
+        </div>
+        <div className="flex items-center justify-between"><span>PII 마스킹</span><Switch checked={policy.pii_redaction} onCheckedChange={(v)=>onChange({...policy, pii_redaction: v})}/></div>
+        <Separator/>
+        <div className="flex items-center justify-between"><span>메모리 저장</span><Switch checked={policy.memory_enabled} onCheckedChange={(v)=>onChange({...policy, memory_enabled: v})}/></div>
+        <div className="text-xs text-muted-foreground">scope: {policy.memory_scope.join(", ")}</div>
+        <Separator/>
+        <div className="flex items-center justify-between"><span>학습 허용</span><Switch checked={policy.training_enabled} onCheckedChange={(v)=>onChange({...policy, training_enabled: v})}/></div>
+        <div className="space-y-1">
+          <div className="text-xs">DP ε (옵션)</div>
+          <Slider min={0.1} max={10} step={0.1} value={[policy.dp_epsilon ?? 1]} onValueChange={(v)=>onChange({...policy, dp_epsilon: v[0]})}/>
+        </div>
+        <Separator/>
+        <div className="text-xs">보존일수: transcript {policy.retention_days.transcript} · psilog {policy.retention_days.psilog} · index {policy.retention_days.rag_index} · memory {policy.retention_days.memory}</div>
+      </CardContent>
+    </Card>
+  );
+};
+
+// ─────────────────────────────── Main App ───────────────────────────────
+export default function AstraeusChatApp() {
+  const [messages, setMessages] = useState<Message[]>(SEED_MESSAGES);
+  const [policy, setPolicy] = useState<DataPolicy>(DEFAULT_POLICY);
+  const [input, setInput] = useState("");
+  const [showRight, setShowRight] = useState(true);
+  const [mode, setMode] = useState<"Ask"|"Plan"|"Build"|"Verify"|"Review">("Ask");
+
+  function pushAssistant(text: string, psi: Partial<PsiLog> = {}, artifacts: Message["artifacts"] = []) {
+    const p: PsiLog = { chi: 0.94, ecr: 1.0, delta_s: -0.05, delta_r: 0.01, route: 7, tools: ["python"], duration_ms: 800, timestamp: nowISO(), ...psi };
+    const gate = estopGate(p);
+    const id = "m" + (messages.length + 1);
+    const safeText = gate.ok ? text : `ESTOP: ${gate.reason} → 보수 경로/재탐색을 실시합니다.`;
+    setMessages((prev) => [...prev, { id, role: "assistant", text: safeText, artifacts, psi: p }]);
+  }
+
+  function handleSend() {
+    if (!input.trim()) return;
+    const id = "m" + (messages.length + 1);
+    const userMsg: Message = { id, role: "user", text: input.trim(), psi: { chi: 0.92, ecr: 1.0, delta_s: -0.02, delta_r: 0.01, route: 5, tools: [], timestamp: nowISO() } };
+    setMessages((prev) => [...prev, userMsg]);
+
+    // Toy command parser
+    if (input.startsWith("/recon")) {
+      // Example: /recon L  => reconstruct L-shape case
+      const Top = [ [1,0,0], [1,1,1] ];
+      const Front = [2,1,1];
+      const Right = [1,2];
+      try {
+        const H = reconstructMin(Top, Front, Right);
+        pushAssistant("투영 최소해 복원 성공. H=" + JSON.stringify(H), { route: 5, tools: ["python"], chi: 0.95, delta_s: -0.06 }, [ { type: "json", label: "H(heightmap)", payload: H } ]);
+      } catch (e:any) {
+        pushAssistant("복원 실패: " + e.message, { chi: 0.6, delta_r: 0.05 });
+      }
+    } else if (input.startsWith("/score")) {
+      const psi: PsiLog = { chi: 0.91, ecr: 1.0, delta_s: -0.02, delta_r: 0.02, route: 7, tools: ["sim"], timestamp: nowISO() };
+      const s = scoreCorridor(psi, 0.3);
+      pushAssistant(`Corridor 점수: ${fmt(s,3)} (χ=${fmt(psi.chi)}, ΔR=${fmt(psi.delta_r)}, ΔS=${fmt(psi.delta_s)})`, psi);
+    } else if (input.startsWith("/policy")) {
+      pushAssistant("현재 데이터 정책: " + JSON.stringify(policy), { route: 3, tools: ["policy"] });
+    } else {
+      pushAssistant("요청을 접수했습니다. 진단→검증 후 ψ‑log와 함께 응답합니다.", { route: 5 });
+    }
+
+    setInput("");
+  }
+
+  return (
+    <TooltipProvider>
+      <div className="w-full h-[min(92vh,900px)] mx-auto max-w-6xl grid grid-cols-12 gap-3 p-3">
+        {/* Left: chat stream */}
+        <div className={`col-span-${showRight?"8":"12"} flex flex-col gap-3`}>
+          <div className="flex items-center justify-between">
+            <div className="flex gap-2 items-center">
+              <Chip active={mode==="Ask"} onClick={()=>setMode("Ask")}>Ask</Chip>
+              <Chip active={mode==="Plan"} onClick={()=>setMode("Plan")}>Plan</Chip>
+              <Chip active={mode==="Build"} onClick={()=>setMode("Build")}>Build</Chip>
+              <Chip active={mode==="Verify"} onClick={()=>setMode("Verify")}>Verify</Chip>
+              <Chip active={mode==="Review"} onClick={()=>setMode("Review")}>Review</Chip>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-muted-foreground"><Gauge size={16}/> route auto · ψ‑log on</div>
+          </div>
+
+          <ScrollArea className="flex-1 rounded-md border p-2">
+            <div className="space-y-3">
+              {messages.map((m) => <MessageCard key={m.id} m={m} />)}
+            </div>
+          </ScrollArea>
+
+          <Card>
+            <CardContent className="p-2">
+              <div className="flex items-center gap-2">
+                <Input value={input} onChange={(e)=>setInput(e.target.value)} placeholder="메시지 또는 명령 (/recon, /score, /policy)…"/>
+                <Button onClick={handleSend}><Play className="mr-1" size={16}/>보내기</Button>
+                <Button variant="ghost" onClick={()=>setShowRight(!showRight)}>{showRight? <PanelRightClose size={16}/>:<PanelRightOpen size={16}/>}</Button>
+              </div>
+              <div className="flex flex-wrap gap-2 mt-2 text-xs text-muted-foreground">
+                <Badge variant="outline">/recon</Badge>
+                <Badge variant="outline">/score</Badge>
+                <Badge variant="outline">/policy</Badge>
+                <span className="ml-2">임계: CHI≥0.90 · ECR=1.0 · ΔR≤0.03</span>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Right: artifacts & policy */}
+        {showRight && (
+          <div className="col-span-4 space-y-3">
+            <Tabs defaultValue="artifacts">
+              <TabsList className="grid grid-cols-3">
+                <TabsTrigger value="artifacts"><FileJson size={14}/> 아티팩트</TabsTrigger>
+                <TabsTrigger value="policy"><Lock size={14}/> 정책</TabsTrigger>
+                <TabsTrigger value="review"><Activity size={14}/> 리뷰</TabsTrigger>
+              </TabsList>
+              <TabsContent value="artifacts">
+                <Card className="shadow-sm">
+                  <CardHeader className="pb-2"><div className="flex items-center gap-2"><BookOpen size={16}/>최근 아티팩트</div></CardHeader>
+                  <CardContent className="space-y-2 text-sm">
+                    {messages.flatMap(m=>m.artifacts?.map((a,i)=>(
+                      <div key={`${m.id}-${i}`} className="flex items-center justify-between border rounded-md p-2">
+                        <div className="truncate"><b>{a.type}</b> · {a.label}</div>
+                        <Badge variant="outline">from {m.id}</Badge>
+                      </div>
+                    )) || []).slice(-6)}
+                    {messages.every(m=>!m.artifacts||m.artifacts.length===0) && <div className="text-muted-foreground">표시할 아티팩트가 없습니다.</div>}
+                  </CardContent>
+                </Card>
+              </TabsContent>
+              <TabsContent value="policy"><PolicyPanel policy={policy} onChange={setPolicy}/></TabsContent>
+              <TabsContent value="review">
+                <Card className="shadow-sm">
+                  <CardHeader className="pb-2"><div className="flex items-center gap-2"><GitBranch size={16}/>세션 리뷰</div></CardHeader>
+                  <CardContent className="space-y-2 text-sm">
+                    <div>메시지 수: {messages.length}</div>
+                    <div>평균 χ: {fmt(messages.reduce((s,m)=>s+m.psi.chi,0)/messages.length)}</div>
+                    <div>평균 ΔR: {fmt(messages.reduce((s,m)=>s+m.psi.delta_r,0)/messages.length)}</div>
+                    <div className="text-xs text-muted-foreground">카드 하단의 ψ‑배지에서 게이트 위반 시 ESTOP가 표시됩니다.</div>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+            </Tabs>
+          </div>
+        )}
+      </div>
+    </TooltipProvider>
+  );
+}
+
+/* ─────────────────────────────── README SNIPPET ───────────────────────────────
+# Astraeus One-Window Chat (Prototype)
+
+## Getting Started
+1) Create a Next.js app with Tailwind + shadcn/ui.
+2) Drop this file under `app/(demo)/AstraeusChatApp.tsx` and render it in a page.
+3) Ensure shadcn components are available (e.g., `@/components/ui/card`).
+
+## Slash Commands (demo)
+- `/recon`  → run minimal projection reconstruction (Top/Front/Right)
+- `/score`  → compute a toy corridor score combining χ, ΔR, ΔS
+- `/policy` → print current data policy switches (A–D layers)
+
+## Safety Gates (defaults)
+- CHI ≥ 0.90 · ECR = 1.0 · ΔR ≤ 0.03 ⇒ SAFE else ESTOP
+
+## Notes
+- This UI is a shell; wire your model/tools to populate `route/tools/psi` and artifacts.
+- Data-policy switches are UI-only; connect them to your backend (RAG index, memory store, FT pipeline).
+*/
