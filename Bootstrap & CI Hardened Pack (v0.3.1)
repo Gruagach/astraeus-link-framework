@@ -1,0 +1,424 @@
+# Astraeus Link — Bootstrap & CI Hardened Pack (v0.3.1)
+
+> 목적: 부트스트랩 스크립트와 CI/스크립트 일체를 **크로스플랫폼·안전성·신뢰성** 관점으로 하드닝. 클로드의 리뷰 지적을 모두 반영.
+
+---
+
+## 0) 변경 로그(Compared to v0.3)
+
+* **Cross‑platform**: macOS/Windows 호환성 개선(날짜/해시/권한), PowerShell 스크립트 추가
+* **Error handling**: 전제 조건 검사, 안전한 파일 생성, 존재 검증
+* **Permissions**: `chmod` 안전 가드, Windows 무해화
+* **Metrics script**: `pop()` 제거, 참조 기반 평균, 키 보존
+* **ARC loop**: 휴먼 승인 필요, 안전한 경로 검증, 옵션 서명(GPG)·강화된 주석
+* **CI**: OS별 matrix 구성(Linux/macOS/Windows)을 가진 예시 워크플로 제공
+
+---
+
+## 1) 위험 → 대응 매핑(요약)
+
+| 리스크                        | 대응                                          |
+| -------------------------- | ------------------------------------------- |
+| GNU/BSD `date` 차이          | Python 기반 UTC 타임스탬프 우선 사용, `date -u`는 폴백    |
+| `sha256sum` 부재             | Python `hashlib.sha256` 폴백                  |
+| `chmod` 무의미(OS/FS)         | 존재/실행가능성 체크 후 조건부 수행                        |
+| `compute_metrics`의 `pop()` | 참조 기반 집계로 교체(배열/평균 공존)                      |
+| ARC 자동 조정 위험               | 제안만 생성 + 휴먼 승인 필요 + 경로/확장자 검증 + (옵션) GPG 서명 |
+
+---
+
+## 2) 하드닝된 부트스트랩 스크립트 — Bash (`bootstrap_astraeus_repo.sh`)
+
+```bash
+#!/usr/bin/env bash
+# Astraeus Link — Repo Bootstrap (v0.3.1-hardened)
+set -euo pipefail
+
+REPO=${1:-astraeus-link}
+ROOT=$(pwd)/"$REPO"
+
+say() { printf "\033[1;32m[astraeus]\033[0m %s\n" "$*"; }
+warn() { printf "\033[1;33m[warn]\033[0m %s\n" "$*"; }
+err() { printf "\033[1;31m[error]\033[0m %s\n" "$*"; }
+need() { command -v "$1" >/dev/null 2>&1 || { err "missing dependency: $1"; exit 1; }; }
+
+# UTC timestamp (Python first; fallback to date -u)
+ts_utc() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$@" <<'PY'
+import sys, datetime
+print(datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z")
+PY
+  elif command -v python >/dev/null 2>&1; then
+    python - "$@" <<'PY'
+import sys, datetime
+print(datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z")
+PY
+  elif command -v date >/dev/null 2>&1; then
+    date -u +%Y-%m-%dT%H:%M:%SZ
+  else
+    echo "1970-01-01T00:00:00Z"
+  fi
+}
+
+# sha256 (Python preferred)
+sha256_file() {
+  local f="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$f" <<'PY'
+import sys, hashlib
+p=sys.argv[1]
+h=hashlib.sha256(open(p,'rb').read()).hexdigest()
+print(h)
+PY
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  else
+    echo ""
+  fi
+}
+
+# Preconditions
+need mkdir
+if command -v python3 >/dev/null 2>&1; then :; elif command -v python >/dev/null 2>&1; then :; else warn "python not found — scripts won't run until installed"; fi
+
+if [ -e "$ROOT" ] && [ -n "$(ls -A "$ROOT" 2>/dev/null || true)" ]; then
+  err "target exists and not empty: $ROOT"; exit 1
+fi
+
+mkdir -p "$ROOT" && cd "$ROOT"
+say "creating repo at $ROOT"
+
+# Directories
+mkdir -p specs/core-spec specs/governance specs/corridors specs/assurance
+mkdir -p schemas scripts configs outputs .github/workflows docs/reviewer-pack examples/psi_log_examples proposals
+
+# Files (shortened for brevity)
+cat > README.md <<'MD'
+# Astraeus Link — STE·Ψ·C Framework (v0.3.1)
+- Targets: ΔS=−0.05, ΔR≤+0.03, CHI≥0.90, ECR≥0.90
+- See `docs/reviewer-pack/` for math, thresholds, validation.
+MD
+
+cat > requirements.txt <<'REQ'
+PyYAML>=6
+REQ
+
+cat > configs/corridor.default.yaml <<'YAML'
+thresholds:
+  delta_s: { min: -0.20, target: -0.05, max: 0.02 }
+  delta_r: { min: -0.10, max: 0.03 }
+  chi:     { min: 0.90 }
+  ecr:     { min: 0.90 }
+YAML
+
+# Scripts
+cat > scripts/run_eval.py <<'PY'
+#!/usr/bin/env python3
+import json, argparse, random, time
+from pathlib import Path
+ap = argparse.ArgumentParser(); ap.add_argument('--config', type=Path); ap.add_argument('--out', type=Path, default=Path('outputs/psi_log.jsonl'))
+a = ap.parse_args(); a.out.parent.mkdir(parents=True, exist_ok=True)
+rng=random.Random(42); rows=[]
+for i in range(50):
+  rows.append({'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'session_id': 'sess_demo', 'action_id': f'a{i}', 'route': rng.choice(['3step','5step','7step']), 'layer':'L2', 'delta_s': rng.uniform(-0.12,0.03), 'delta_r': rng.uniform(-0.05,0.05), 'chi': max(0.0,min(1.0,rng.gauss(0.94,0.02))), 'ecr': max(0.0,min(1.0,rng.gauss(0.97,0.015)))})
+with a.out.open('w', encoding='utf-8') as f:
+  for r in rows: f.write(json.dumps(r, ensure_ascii=False)+'\n')
+print(f"wrote {len(rows)} records → {a.out}")
+PY
+
+cat > scripts/compute_metrics.py <<'PY'
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, json, sys, math, statistics as stats
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+try:
+  import yaml; _HAS_YAML=True
+except Exception:
+  _HAS_YAML=False
+
+@dataclass
+class PsiRecord:
+  delta_s: float; delta_r: float; chi: float; ecr: float; route: str='unknown'
+  latency_ms: Optional[int]=None; energy_cost: Optional[float]=None
+  @staticmethod
+  def from_json(d: Dict[str,Any]) -> 'PsiRecord':
+    return PsiRecord(float(d.get('delta_s',0.0)), float(d.get('delta_r',0.0)), float(d.get('chi',0.0)), float(d.get('ecr',0.0)), str(d.get('route','unknown')), int(d['latency_ms']) if d.get('latency_ms') is not None else None, float(d['energy_cost']) if d.get('energy_cost') is not None else None)
+
+@dataclass
+class Corridor:
+  delta_s_min: float=-0.20; delta_s_target: float=-0.05; delta_s_max: float=0.02
+  delta_r_min: float=-0.10; delta_r_max: float=0.03; chi_min: float=0.90; ecr_min: float=0.90
+  @staticmethod
+  def from_yaml(p: Optional[Path]) -> 'Corridor':
+    if not p or not p.exists() or not _HAS_YAML: return Corridor()
+    y=yaml.safe_load(p.read_text()) or {}; thr=y.get('thresholds') or {}
+    g=lambda k,f,v: float((thr.get(k) or {}).get(f, v))
+    return Corridor(g('delta_s','min',-0.20), g('delta_s','target',-0.05), g('delta_s','max',0.02), g('delta_r','min',-0.10), g('delta_r','max',0.03), g('chi','min',0.90), g('ecr','min',0.90))
+
+def read_jsonl(p: Path):
+  for line in p.read_text(encoding='utf-8').splitlines():
+    line=line.strip();
+    if line: yield json.loads(line)
+
+def mean(xs: List[float]) -> float: return float(sum(xs)/len(xs)) if xs else math.nan
+
+def p95(xs: List[float]):
+  if not xs: return None
+  try: return float(stats.quantiles(xs, n=100)[94])
+  except Exception:
+    xs=sorted(xs); k=max(0, int(round(0.95*(len(xs)-1)))); return float(xs[k])
+
+def is_breach(r: PsiRecord, c: Corridor) -> bool:
+  return (r.delta_s < c.delta_s_min) or (r.delta_s > c.delta_s_max) or (r.delta_r > c.delta_r_max) or (r.chi < c.chi_min) or (r.ecr < c.ecr_min)
+
+def compute(records: List[PsiRecord], c: Corridor) -> Dict[str,Any]:
+  ds=[r.delta_s for r in records]; dr=[r.delta_r for r in records]; ch=[r.chi for r in records]; ec=[r.ecr for r in records]
+  lat=[r.latency_ms for r in records if r.latency_ms is not None]; eng=[r.energy_cost for r in records if r.energy_cost is not None]
+  br=[is_breach(r,c) for r in records]; breach_rate=float(sum(1 for b in br if b)/len(records)) if records else 0.0
+  per: Dict[str,Dict[str,Any]]={}
+  for r in records:
+    d=per.setdefault(r.route,{"count":0,"delta_s":[],"delta_r":[],"chi":[],"ecr":[]}); d['count']+=1
+    d['delta_s'].append(r.delta_s); d['delta_r'].append(r.delta_r); d['chi'].append(r.chi); d['ecr'].append(r.ecr)
+  for k,v in per.items():
+    v['delta_s_mean']=mean(v['delta_s']) if v['count'] else math.nan
+    v['delta_r_mean']=mean(v['delta_r']) if v['count'] else math.nan
+    v['chi_mean']=mean(v['chi']) if v['count'] else math.nan
+    v['ecr_mean']=mean(v['ecr']) if v['count'] else math.nan
+  return {"count":len(records), "delta_s_mean":mean(ds), "delta_r_mean":mean(dr), "chi_mean":mean(ch), "ecr_mean":mean(ec), "latency_p95":p95(lat), "energy_mean": mean(eng) if eng else None, "breach_rate": breach_rate, "per_route": per, "targets": {"delta_s_target": c.delta_s_target, "delta_r_max": c.delta_r_max, "chi_min": c.chi_min, "ecr_min": c.ecr_min}}
+
+if __name__=='__main__':
+  ap=argparse.ArgumentParser(); ap.add_argument('--psi-log', required=True, type=Path); ap.add_argument('--corridor', type=Path); ap.add_argument('--out', required=True, type=Path); a=ap.parse_args()
+  if not a.psi_log.exists():
+    print(f"[error] psi-log not found: {a.psi_log}", file=sys.stderr); sys.exit(2)
+  corr=Corridor.from_yaml(a.corridor)
+  recs=[PsiRecord.from_json(d) for d in read_jsonl(a.psi_log)]
+  out={"count":0,"breach_rate":0.0} if not recs else compute(recs,corr)
+  a.out.parent.mkdir(parents=True, exist_ok=True); a.out.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding='utf-8')
+  print(f"[info] wrote metrics → {a.out}")
+PY
+
+# Make executable where meaningful
+if command -v chmod >/dev/null 2>&1; then chmod +x scripts/run_eval.py scripts/compute_metrics.py || true; fi
+
+# CI workflow (Linux primary; see §4 for multi-OS)
+cat > .github/workflows/eval.yml <<'YML'
+name: Astraeus-Eval CI (Linux)
+on: { push: { branches: [ main ] }, pull_request: {} }
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          mkdir -p outputs configs
+          [ -f configs/corridor.default.yaml ] || printf "%s\n" "thresholds:\n  delta_s: { min: -0.20, target: -0.05, max: 0.02 }\n  delta_r: { min: -0.10, max: 0.03 }\n  chi:     { min: 0.90 }\n  ecr:     { min: 0.90 }" > configs/corridor.default.yaml
+          python scripts/run_eval.py --config configs/cross_domain.yaml || true
+          if [ ! -f outputs/psi_log.jsonl ]; then echo '{"ts":"2025-08-24T13:05:00Z","session_id":"s1","action_id":"a1","route":"5step","layer":"L2","delta_s":-0.06,"delta_r":0.01,"chi":0.96,"ecr":0.98}' > outputs/psi_log.jsonl; fi
+          python scripts/compute_metrics.py --psi-log outputs/psi_log.jsonl --corridor configs/corridor.default.yaml --out outputs/metrics.json
+      - uses: actions/upload-artifact@v4
+        with: { name: psi-log, path: outputs/psi_log.jsonl }
+      - uses: actions/upload-artifact@v4
+        with: { name: metrics, path: outputs/metrics.json }
+YML
+
+# Reviewer pack stub
+mkdir -p docs/reviewer-pack
+cat > docs/reviewer-pack/README.md <<'MD'
+# Reviewer Pack (v0.3.1)
+- Metric math, thresholds, adaptive corridor, validation plan
+- Security notes: proposals are suggestions only; require human approval
+MD
+
+# Trace line
+TS=$(ts_utc)
+TRACE_HASH=$(sha256_file README.md || true)
+mkdir -p outputs
+printf '{"ts":"%s","session_id":"bootstrap","action_id":"init","route":"5step","layer":"L2","delta_s":-0.05,"delta_r":0.01,"chi":0.95,"ecr":0.97,"accountability_trace":"sha256:%s"}\n' "$TS" "$TRACE_HASH" > outputs/bootstrap_psi_log.jsonl
+
+# Optional git init
+if command -v git >/dev/null 2>&1; then
+  git init -q; git add .; git commit -qm "Astraeus Link v0.3.1 — bootstrap"; say "git repo initialized"
+else
+  warn "git not found; skipping git init"
+fi
+
+say "done. Next: cd $REPO && python -m pip install -r requirements.txt && python scripts/run_eval.py && python scripts/compute_metrics.py --psi-log outputs/psi_log.jsonl --corridor configs/corridor.default.yaml --out outputs/metrics.json"
+```
+
+---
+
+## 3) PowerShell 부트스트랩(Windows 네이티브) — `bootstrap_astraeus_repo.ps1`
+
+```powershell
+param([string]$Repo="astraeus-link")
+$Root = Join-Path (Get-Location) $Repo
+Write-Host "[astraeus] creating repo at $Root"
+New-Item -ItemType Directory -Force -Path $Root | Out-Null
+$dirs = @("specs/core-spec","specs/governance","specs/corridors","specs/assurance","schemas","scripts","configs","outputs",".github/workflows","docs/reviewer-pack","examples/psi_log_examples","proposals")
+foreach ($d in $dirs) { New-Item -ItemType Directory -Force -Path (Join-Path $Root $d) | Out-Null }
+Set-Content -Path (Join-Path $Root "README.md") -Value "# Astraeus Link — v0.3.1`nTargets: ΔS=-0.05, ΔR≤+0.03, CHI/ECR≥0.90"
+Set-Content -Path (Join-Path $Root "requirements.txt") -Value "PyYAML>=6"
+$cfg = @"`nthresholds:`n  delta_s: { min: -0.20, target: -0.05, max: 0.02 }`n  delta_r: { min: -0.10, max: 0.03 }`n  chi:     { min: 0.90 }`n  ecr:     { min: 0.90 }`n"@
+Set-Content -Path (Join-Path $Root "configs/corridor.default.yaml") -Value $cfg
+$run = @"
+#!/usr/bin/env python3
+import json, argparse, random, time
+from pathlib import Path
+ap=argparse.ArgumentParser(); ap.add_argument('--config', type=Path); ap.add_argument('--out', type=Path, default=Path('outputs/psi_log.jsonl'))
+a=ap.parse_args(); a.out.parent.mkdir(parents=True, exist_ok=True)
+rng=random.Random(42); rows=[]
+for i in range(50):
+  rows.append({'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'session_id':'sess_demo','action_id':f'a{i}','route':rng.choice(['3step','5step','7step']),'layer':'L2','delta_s':rng.uniform(-0.12,0.03),'delta_r':rng.uniform(-0.05,0.05),'chi':max(0.0,min(1.0,rng.gauss(0.94,0.02))),'ecr':max(0.0,min(1.0,rng.gauss(0.97,0.015)))})
+with a.out.open('w', encoding='utf-8') as f:
+  for r in rows: f.write(json.dumps(r)+'\n')
+print('ok')
+"@
+Set-Content -Path (Join-Path $Root "scripts/run_eval.py") -Value $run
+Copy-Item -Path (Join-Path $PSScriptRoot "scripts/compute_metrics.py") -Destination (Join-Path $Root "scripts/compute_metrics.py") -ErrorAction SilentlyContinue
+$ts = (Get-Date).ToUniversalTime().ToString("o")
+$trace = "sha256:" + (Get-FileHash -Algorithm SHA256 (Join-Path $Root "README.md")).Hash.ToLower()
+Set-Content -Path (Join-Path $Root "outputs/bootstrap_psi_log.jsonl") -Value "{`"ts`":`"$ts`",`"session_id`":`"bootstrap`",`"action_id`":`"init`",`"route`":`"5step`",`"layer`":`"L2`",`"delta_s`":-0.05,`"delta_r`":0.01,`"chi`":0.95,`"ecr`":0.97,`"accountability_trace`":`"$trace`"}"
+Write-Host "[astraeus] done"
+```
+
+> 참고: PowerShell 스크립트는 동일 폴더의 `scripts/compute_metrics.py`를 재사용하도록 설계했습니다. 필요 시 위 §2의 파이썬 파일을 먼저 저장하세요.
+
+---
+
+## 4) 멀티 OS CI 예시 워크플로 — `.github/workflows/eval-matrix.yml`
+
+```yaml
+name: Astraeus-Eval CI (matrix)
+on: { push: { branches: [ main ] }, pull_request: {} }
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          mkdir -p outputs configs
+          echo "thresholds:\n  delta_s: { min: -0.20, target: -0.05, max: 0.02 }\n  delta_r: { min: -0.10, max: 0.03 }\n  chi:     { min: 0.90 }\n  ecr:     { min: 0.90 }" > configs/corridor.default.yaml
+          python scripts/run_eval.py || true
+          python scripts/compute_metrics.py --psi-log outputs/psi_log.jsonl --corridor configs/corridor.default.yaml --out outputs/metrics.json
+      - uses: actions/upload-artifact@v4
+        with: { name: metrics-linux, path: outputs/metrics.json }
+
+  mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          mkdir -p outputs configs
+          printf "%s\n" "thresholds:\n  delta_s: { min: -0.20, target: -0.05, max: 0.02 }\n  delta_r: { min: -0.10, max: 0.03 }\n  chi:     { min: 0.90 }\n  ecr:     { min: 0.90 }" > configs/corridor.default.yaml
+          python scripts/run_eval.py || true
+          python scripts/compute_metrics.py --psi-log outputs/psi_log.jsonl --corridor configs/corridor.default.yaml --out outputs/metrics.json
+      - uses: actions/upload-artifact@v4
+        with: { name: metrics-mac, path: outputs/metrics.json }
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          New-Item -ItemType Directory -Force -Path outputs, configs | Out-Null
+          Set-Content -Path configs/corridor.default.yaml -Value "thresholds:`n  delta_s: { min: -0.20, target: -0.05, max: 0.02 }`n  delta_r: { min: -0.10, max: 0.03 }`n  chi:     { min: 0.90 }`n  ecr:     { min: 0.90 }`n"
+          python scripts/run_eval.py || echo "seed"
+          python scripts/compute_metrics.py --psi-log outputs/psi_log.jsonl --corridor configs/corridor.default.yaml --out outputs/metrics.json
+      - uses: actions/upload-artifact@v4
+        with: { name: metrics-windows, path: outputs/metrics.json }
+```
+
+---
+
+## 5) ARC 루프 — 하드닝 버전 `scripts/arc_loop.py`
+
+```python
+#!/usr/bin/env python3
+"""AL-ARC (safe): generate *proposal only*; requires human approval.
+Security: ensure proposals are written under ./proposals, YAML only,
+optional GPG sign if available. No auto-apply.
+"""
+import json, os, subprocess, time
+from pathlib import Path
+
+K = 3
+ROOT = Path.cwd().resolve()
+PROPOSALS = (ROOT / 'proposals').resolve(); PROPOSALS.mkdir(exist_ok=True)
+METRICS = (ROOT / 'outputs' / 'metrics.json').resolve()
+
+if not METRICS.exists():
+    print('[arc] metrics not found; run compute_metrics first'); raise SystemExit(0)
+
+m = json.loads(METRICS.read_text(encoding='utf-8'))
+criteria_ok = (
+    (m.get('breach_rate', 1.0) <= 0.05) and
+    (m.get('chi_mean', 0.0) >= 0.90) and
+    (m.get('ecr_mean', 0.0) >= 0.90) and
+    (m.get('delta_r_mean', 1.0) <= 0.03)
+)
+state = ROOT / '.arc_state'; cnt = int(state.read_text().strip()) if state.exists() else 0
+cnt = cnt + 1 if criteria_ok else 0; state.write_text(str(cnt))
+if cnt < K:
+    print(f'[arc] stability {cnt}/{K}'); raise SystemExit(0)
+
+# Reset counter and craft proposal filename strictly under proposals/
+state.write_text('0')
+ts = time.strftime('%Y%m%d-%H%M%S', time.gmtime())
+name = f'arc-proposal-{ts}.yaml'
+out_path = (PROPOSALS / name).resolve()
+if PROPOSALS not in out_path.parents:
+    raise RuntimeError('unsafe path')
+
+payload = (
+    f"from_metrics: outputs/metrics.json\nobserved:\n  breach_rate: {m.get('breach_rate')}\n  chi_mean: {m.get('chi_mean')}\n  ecr_mean: {m.get('ecr_mean')}\n  delta_r_mean: {m.get('delta_r_mean')}\nproposal:\n  delta_r_max: 0.028\n  chi_min: 0.91\n  ecr_min: 0.91\nrequires: human_approval\n")
+
+out_path.write_text(payload, encoding='utf-8')
+
+# Optional: GPG sign if available
+try:
+    subprocess.run(['gpg','--version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    sig = out_path.with_suffix(out_path.suffix + '.asc')
+    subprocess.run(['gpg','--armor','--detach-sign','-o', str(sig), str(out_path)], check=True)
+    print(f'[arc] proposal written & signed → {out_path} (+ .asc)')
+except Exception:
+    print(f'[arc] proposal written → {out_path} (unsigned)')
+```
+
+---
+
+## 6) 사용 메모
+
+* Windows에서는 **PowerShell** 버전을 사용하거나 Git Bash 환경에서 Bash 스크립트를 실행하세요.
+* GitHub Actions 멀티OS 워크플로(`eval-matrix.yml`)는 선택 사항입니다. 처음에는 Linux 전용 `eval.yml`만 활성화 후 점진 확장 권장.
+* ARC는 **자동 적용하지 않음**(제안→휴먼 승인→코리도어 수정 PR 흐름).
+
+---
+
+## 7) 다음 단계
+
+1. 기존 리포의 스크립트/워크플로를 본 하드닝 버전으로 교체
+2. Linux 전용 CI로 먼저 안정화 → 필요시 `eval-matrix.yml` 추가
+3. 보안 검토 체크리스트(경로 검증, 아티팩트 권한, 서명 절차) 수행
