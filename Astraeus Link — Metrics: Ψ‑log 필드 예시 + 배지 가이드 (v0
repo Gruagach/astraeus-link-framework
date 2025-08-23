@@ -1,0 +1,128 @@
+# Astraeus Link — Metrics: ψ‑log 필드 예시 + 배지 가이드 (v0.4)
+
+> 목적: **ΔS/ΔR/CHI/ECR** 메트릭 산출을 위한 ψ‑log 필드 표준과 **배지 생성 규칙**(요약 SVG)을 한눈에 볼 수 있도록 정리. Quickstart 흐름(`make poc → make eval`)과 바로 연결됩니다.
+
+---
+
+## 0) 파이프라인 개요
+
+`ψ‑log(JSONL)` → `compute_metrics.py` → `outputs/metrics.json` → `make_badges.py` → `badges/summary.svg` → README 표시.
+
+---
+
+## 1) ψ‑log 코어 필드(배지 연동)
+
+| 필드                     | 타입                            |  필수 | 설명                | 배지/집계 반영             |
+| ---------------------- | ----------------------------- | :-: | ----------------- | -------------------- |
+| `ts`                   | string(date‑time)             |  ✓  | ISO8601 UTC 타임스탬프 | —                    |
+| `session_id`           | string                        |  ✓  | 세션/대화 ID          | —                    |
+| `action_id`            | string                        |  ✓  | 액션/응답 단위 ID       | —                    |
+| `route`                | enum(`3step`,`5step`,`7step`) |  ✓  | 라우팅 단계            | per\_route 집계        |
+| `layer`                | enum(`L0..L3`)                |  ✓  | 제약 강도/샌드박스 레벨     | —                    |
+| `delta_s`              | number                        |  ✓  | **ΔS(불확실성 변화)**   | **ΔS 배지**(평균)        |
+| `delta_r`              | number                        |  ✓  | **ΔR(위험 변화)**     | **ΔR 배지**(평균)        |
+| `chi`                  | number                        |  ✓  | **CHI(인과 조화)**    | **CHI 배지**(평균)       |
+| `ecr`                  | number                        |  ✓  | **ECR(윤리 준수)**    | **ECR 배지**(평균)       |
+| `latency_ms`           | integer                       |     | 응답 지연(밀리초)        | `latency_p95`(선택 배지) |
+| `energy_cost`          | number                        |     | 에너지/비용 추정         | `energy_mean`(요약)    |
+| `risk_vector`          | object                        |     | 카테고리별 위험 점수       | (향후 확장)              |
+| `module`               | string                        |     | 모듈명(CFFL/ACS/…)   | 모듈 추적                |
+| `flags`                | string\[]                     |     | `soft-breach:*` 등 | 위반 빈도 관측             |
+| `accountability_trace` | string                        |     | 해시체인/릴리스 해시       | 감사 용도                |
+
+> 최소 배지 세트(CHI/ECR/ΔS/ΔR)는 위 **네 필드**만 있어도 집계됩니다.
+
+---
+
+## 2) ψ‑log 예시(JSONL)
+
+**(a) 최소 예시)**
+
+```json
+{"ts":"2025-08-24T13:06:00Z","session_id":"s1","action_id":"a2","route":"3step","layer":"L1","delta_s":-0.02,"delta_r":0.00,"chi":0.94,"ecr":0.99}
+```
+
+**(b) 확장 예시: 모듈/리스크/지연 포함)**
+
+```json
+{"ts":"2025-08-24T13:40:00Z","session_id":"s9","action_id":"a77","route":"5step","layer":"L2","module":"CFFL","delta_s":-0.03,"delta_r":0.01,"chi":0.93,"ecr":0.98,"latency_ms":820,"risk_vector":{"policy":0.0,"privacy":0.0,"security":0.0,"content":0.01},"flags":["soft-breach:delta_s_recheck"],"accountability_trace":"sha256:…abcd1234"}
+```
+
+**(c) PEAL 리포팅 예시)**
+
+```json
+{"ts":"2025-08-24T13:41:00Z","session_id":"s9","action_id":"a78","route":"5step","layer":"L2","module":"PEAL","delta_s":-0.01,"delta_r":0.00,"chi":0.95,"ecr":0.99,"energy_cost":0.42,"latency_ms":910}
+```
+
+---
+
+## 3) `metrics.json` ↔ 배지 매핑
+
+집계 스크립트가 생성하는 `outputs/metrics.json`의 주요 키와 배지 연결은 다음과 같습니다.
+
+| 배지 라벨          | `metrics.json` 키 | 색상 규칙(코리도어 기반)                         |
+| -------------- | ---------------- | -------------------------------------- |
+| **CHI**        | `chi_mean`       | `>= chi_min` → 초록 / 그 외 빨강             |
+| **ECR**        | `ecr_mean`       | `>= ecr_min` → 초록 / 그 외 빨강             |
+| **ΔS**         | `delta_s_mean`   | `<= target` 초록 / `<= max` 노랑 / 그 외 빨강  |
+| **ΔR**         | `delta_r_mean`   | `<= max` 초록 / 초과 빨강                    |
+| *(옵션)* **p95** | `latency_p95`    | `<= 200ms` 초록 / `<= 400ms` 노랑 / 그 외 빨강 |
+| *(보조)* breach  | `breach_rate`    | `<=5%` 초록 / `<=10%` 노랑 / 그 외 빨강        |
+
+**예시 `metrics.json`**
+
+```json
+{
+  "count": 52,
+  "delta_s_mean": -0.06,
+  "delta_r_mean": 0.01,
+  "chi_mean": 0.96,
+  "ecr_mean": 0.98,
+  "latency_p95": 188,
+  "breach_rate": 0.02,
+  "targets": {"delta_s_target": -0.05, "delta_r_max": 0.03, "chi_min": 0.90, "ecr_min": 0.90}
+}
+```
+
+---
+
+## 4) 배지 생성 규칙(요약)
+
+배지 스크립트(`scripts/make_badges.py`)는 위 표준 키를 읽어 **수치→라벨/색상**으로 변환해 `badges/summary.svg`를 생성합니다.
+
+* 팔레트: 초록 `#2ea44f`, 노랑 `#dbab09`, 빨강 `#d73a49`, 라벨 배경 `#555`
+* 표기: `CHI/ECR` → 소수점 2자리, `ΔS/ΔR` → 부호 포함 2자리, `breach` → 백분율(소수점 1자리)
+
+---
+
+## 5) README 삽입 스니펫
+
+````md
+## Quickstart
+```bash
+pip install -r requirements.txt
+make poc
+make eval  # metrics + badges
+````
+
+**Metrics Badges**
+![Astraeus Metrics](badges/summary.svg)
+
+```
+
+---
+## 6) 검증 팁
+- **스키마 검증**: `schemas/psi-log.schema.json`으로 JSONL 레코드를 CI에서 검증(예: `python -m jsonschema`)  
+- **범위 점검**: `jq`로 값 범위 샘플링 → 히스토그램/이상치 확인  
+- **샘플 충분성**: `count >= 50` 미만이면 배지 해석을 "스모크"로 표시 권장
+
+---
+## 7) 문제 해결 체크리스트
+- 배지가 비거나 회색이면: `outputs/metrics.json`의 키 유무 확인 → `make eval` 재실행  
+- `latency_p95` 배지가 안 나오면: ψ‑log에 `latency_ms`가 누락되지 않았는지 확인  
+- 색상 기준 변경: `configs/corridor.default.yaml`의 임계값을 조정한 뒤 배지 재생성
+
+---
+> 본 가이드는 리포 `docs/` 또는 `README` 하위 섹션으로 바로 포함 가능합니다. Quickstart와 함께 쓰면, 첫 실행에서 **메트릭 배지**를 즉시 확인할 수 있습니다.
+
+```
