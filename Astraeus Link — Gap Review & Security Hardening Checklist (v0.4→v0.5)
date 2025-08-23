@@ -1,0 +1,223 @@
+# Astraeus Link — Gap Review & Security Hardening Checklist (v0.4→v0.5)
+
+> 목적: 현재 리포(프레임워크·부트스트랩·7‑Modules·Quickstart·Policies)에 대해 **추가 필요/수정/보안 설명**을 한 번에 정리. 바로 커밋 가능한 템플릿과 워크플로 스니펫을 포함합니다.
+
+---
+
+## 0) TL;DR — 바로 할 일 (Top‑10)
+
+1. **Actions 핀 고정**: GitHub Actions를 **SHA 핀**으로 고정(서플라이체인)
+2. **Dependabot + CodeQL**: 의존성/코드 스캔 워크플로 추가
+3. **권한 최소화**: 모든 워크플로 `permissions:` 최소권한 재검토 + 환경 보호 규칙
+4. **Secrets 무노출 보장**: 로그 레드액션 + secret‑scanning + OIDC로 클라우드 시크릿 제거
+5. **SBOM & SLSA**: SBOM 생성(Syft) + 릴리스 서명(cosign/GPG) + SLSA provenance
+6. **E‑Stop 런북**: 사고 대응 절차/라벨/롤백 체크리스트 문서화
+7. **THREAT\_MODEL.md**: STRIDE 표 + 오케스트레이션/ψ‑log 공격면 분석
+8. **데이터 거버넌스**: PRIVACY.md/RETENTION 정책 + PII 필드 금지 규칙
+9. **CI 성능 게이트**: `overhead_p95` 등 성능 게이트를 Stage‑C로 상시화
+10. **YAML 안전 파싱**: `yaml.safe_load` 강제 + YAML 인젝션/빌리언즈 오브 래빗 방지 가이드
+
+---
+
+## 1) 보안·거버넌스 파일(신규 제안)
+
+* `THREAT_MODEL.md` — STRIDE 기준 위협/신호/완화(아래 §2 템플릿)
+* `PRIVACY.md` — 데이터 등급/PII 금지/보관·삭제/DSR(데이터 삭제 요청)
+* `RUNBOOK_ESTOP.md` — E‑Stop 발동→롤백→사후 보고 절차(탭형 체크리스트)
+* `RISK_REGISTER.md` — 창발/사슬 리스크 상시 관리(오케스트레이터 포함)
+* `RELEASE_SIGNING.md` — 릴리스/아티팩트 서명 절차(GPG/cosign)
+
+> README 하단에 **Security/Privacy/Runbook** 링크를 추가하세요.
+
+---
+
+## 2) THREAT\_MODEL.md (템플릿 요약)
+
+| STRIDE              | 자산/면    | 위협 시나리오            | 신호(ψ/otel)                              | 완화                            |
+| ------------------- | ------- | ------------------ | --------------------------------------- | ----------------------------- |
+| **S**poofing        | CI 토큰   | Actions 재사용 토큰 탈취  | `astr.slo.breach{kind=sec}`             | Job‑scoped OIDC, 환경 보호, 최소 권한 |
+| **T**ampering       | ψ‑log   | 공격자 로그 변조→지표 조작    | hash‑chain mismatch, Merkle diff        | append‑only, 서명, 투명성 로그       |
+| **R**epudiation     | 릴리스     | 릴리스 부인             | 서명 부재                                   | 태그/아티팩트 서명, 증명서 보관            |
+| **I**nfo Disclosure | 로그      | PII/시크릿 유출         | secret‑scan, entropy spike              | PII 금지 스키마, 레드액션, 샘플링         |
+| **D**oS             | 모듈 체인   | CFFL↔ACS 오실레이션→과부하 | `overhead_ms p95↑`, `escalation_count↑` | 회로차단기, 쿨다운, 히스테리시스            |
+| **E**levation       | Actions | 취약 액션@버전           | CodeQL alert                            | SHA 핀/권한 최소화/리뷰 필수            |
+
+---
+
+## 3) GitHub Actions 하드닝 스니펫
+
+> 모든 액션을 **커밋 SHA**로 핀 고정하세요.
+
+```yaml
+permissions:
+  contents: read
+  id-token: write  # OIDC 필요 시에만
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a102d24b36 # v4
+      - name: Setup Python
+        uses: actions/setup-python@0a12fe0c597c6b51b0c3019e69058a4eb991f3a0 # v5
+      - name: Upload artifact
+        uses: actions/upload-artifact@89ef406dd8d6adf4b8423e0cba0a70bf8f97b26f # v4
+```
+
+**추가 권장:**
+
+* `paths:`/`paths-ignore:`로 워크플로 트리거 범위 축소
+* 환경 보호(Production env 승인) + 필수 리뷰어 + CODEOWNERS 적용
+
+---
+
+## 4) Dependabot · CodeQL · Scorecard
+
+`.github/dependabot.yml`
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule: { interval: "weekly" }
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule: { interval: "weekly" }
+```
+
+`.github/workflows/codeql.yml`(요약)
+
+```yaml
+name: CodeQL
+on: [push, pull_request]
+permissions: { security-events: write, contents: read }
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde6...
+      - uses: github/codeql-action/init@e5f05f7...
+        with: { languages: python }
+      - uses: github/codeql-action/analyze@e5f05f7...
+```
+
+`scorecard.yml`(선택)
+
+```yaml
+name: OpenSSF Scorecard
+on: [push]
+permissions: { security-events: write, contents: read }
+```
+
+---
+
+## 5) SBOM · SLSA · 릴리스 서명
+
+* **SBOM**: `syft packages dir:. -o spdx-json > sbom.spdx.json`
+* **Provenance(SLSA)**: GitHub OIDC + provenance 생성 워크플로 추가
+* **서명**:
+
+  * GPG: 태그/릴리스 아티팩트 서명 → 공개키 `SECURITY-PUBLIC-KEY.asc` 배포
+  * cosign: `cosign sign-blob`로 SBOM/metrics 서명(공용 OIDC/키리스도 가능)
+
+---
+
+## 6) PRIVACY.md (요약 템플릿)
+
+* **수집 최소화**: ψ‑log에서 PII 필드 금지, 세션 식별자는 난수/해시
+* **보존/삭제**: 기본 90일 보존, 익명 집계는 1년, 삭제 요청(DSR) 처리 SLA 30일
+* **민감도 등급**: public/internal/confidential; 로그는 기본 internal
+* **전송/보관 암호화**: TLS1.2+, 저장소 KMS/Keyrotation
+
+---
+
+## 7) RUNBOOK\_ESTOP.md (요약 템플릿)
+
+1. **Trigger**: Stage‑B/C 게이트 실패 또는 정책 하드 브리치 탐지
+2. **Immediate**: 라우팅 상향 → 재시도; 지속 실패시 `E‑Stop` 라벨 부여 & 배포 차단
+3. **Rollback**: 마지막 안정 태그로 롤백
+4. **Comms**: 템플릿(내부 채널/공개 공지) 사용
+5. **Post‑mortem**: 48h 내 초안, 7일 내 확정; ψ‑log/Metrics/PR 타임라인 첨부
+
+---
+
+## 8) YAML·파서 보안 가이드
+
+* 항상 `yaml.safe_load` 사용(이미 적용) — 문서에 명시
+* YAML 입력 검증: 화이트리스트 키·타입, 최대 크기 제한, 앵커/별칭 제한
+* YAML 폭탄 방지: 파일 크기/노드 카운트 상한(예: 1MB/50k 노드)
+
+---
+
+## 9) ψ‑log 무결성 강화
+
+* **Append‑only** 파일 권한(예: `0640`) + 별도 **감사 버킷**으로 주기적 스냅샷
+* **Merkle Transparency**: 주기적으로 Merkle root를 `NOTICE` 또는 릴리스 주석에 게시
+* **중복/이상 탐지**: action\_id 고유성, 타임스탬프 역행 알림
+
+---
+
+## 10) CI 성능 게이트(상시화)
+
+`eval.yml` Stage‑C에 추가:
+
+```yaml
+- name: Perf gate
+  run: |
+    P95=$(jq -r '.latency_p95 // 0' outputs/metrics.json)
+    (( $(printf '%.0f' "$P95") <= 200 )) || { echo 'Perf gate fail'; exit 1; }
+```
+
+---
+
+## 11) License/Notice 정리
+
+* 코드: **Apache‑2.0**, 문서: **CC‑BY‑4.0**(이미 초안 제공) → 각 소스 헤더 추가
+* `NOTICE`에 3rd‑party 공지 추가(예: 샘플 액션/도구 라이선스)
+* `REUSE` 규칙(선택): 파일별 라이선스 스패너 적용
+
+---
+
+## 12) 체크리스트 (PR용)
+
+* [ ] Actions SHA 핀 고정 완료
+* [ ] Dependabot/CodeQL/Scorecard 동작
+* [ ] SBOM 생성 및 릴리스 서명
+* [ ] PRIVACY/RUNBOOK/THREAT\_MODEL 문서 추가
+* [ ] CI Stage‑C(성능) 활성화
+* [ ] ψ‑log 무결성(append‑only+Merkle) 도입
+* [ ] 환경 보호/필수 리뷰어/브랜치 보호 규칙 설정
+
+---
+
+## 13) 부록 — 샘플 파일 스켈레톤
+
+**`THREAT_MODEL.md` 헤더**
+
+```md
+# Threat Model (STRIDE)
+Scope: ψ‑log, Orchestrator, CI/CD, Release, Modules(CFFL/ACS/...)
+Assumptions: No PII; least‑privilege runners; signed releases.
+```
+
+**`PRIVACY.md` 헤더**
+
+```md
+# Privacy & Data Governance
+We minimize data, disallow PII in ψ‑logs, and honor deletion requests.
+```
+
+**`RUNBOOK_ESTOP.md` 헤더**
+
+```md
+# E‑Stop Runbook
+Owner on‑call: @owner — Escalation: @ops, @sec
+```
+
+---
+
+*본 체크리스트를 따라 적용하면 v0.5 릴리스에서 **공개 프로젝트 보안 기준**(서플라이체인·무결성·프라이버시·성능 게이트)을 충족할 수 있습니다.*
