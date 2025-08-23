@@ -1,0 +1,244 @@
+# Quickstart Make & Badges (v0.4)
+
+> 목표: `pip install -r requirements.txt → make poc → make eval → 배지 확인` 흐름을 **즉시 실행** 가능하게 하는 Makefile·배지 생성 스크립트·README 스니펫·(선택) CI 워크플로를 제공합니다.
+
+---
+
+## 1) Makefile (Quickstart 전용)
+
+```makefile
+.PHONY: setup poc eval metrics badges clean
+
+# 1) 환경 준비
+setup:
+	python -m pip install --upgrade pip
+	pip install -r requirements.txt
+
+# 2) 데모 평가 로그 생성 (ψ-log)
+poc:
+	mkdir -p outputs configs badges
+	[ -f configs/corridor.default.yaml ] || \
+	  printf "%s\n" "thresholds:\n  delta_s: { min: -0.20, target: -0.05, max: 0.02 }\n  delta_r: { min: -0.10, max: 0.03 }\n  chi:     { min: 0.90 }\n  ecr:     { min: 0.90 }" > configs/corridor.default.yaml
+	python scripts/run_eval.py --config configs/cross_domain.yaml
+
+# 3) 메트릭 산출
+metrics:
+	python scripts/compute_metrics.py \
+	  --psi-log outputs/psi_log.jsonl \
+	  --corridor configs/corridor.default.yaml \
+	  --out outputs/metrics.json
+
+# 4) 배지 생성(SVG)
+badges:
+	python scripts/make_badges.py \
+	  --metrics outputs/metrics.json \
+	  --corridor configs/corridor.default.yaml \
+	  --out badges/summary.svg
+
+# 5) Quickstart: poc → eval(=metrics+badges)
+eval: metrics badges
+
+clean:
+	rm -rf outputs/*.json outputs/*.jsonl badges/*.svg
+```
+
+---
+
+## 2) 배지 생성 스크립트 — `scripts/make_badges.py`
+
+```python
+#!/usr/bin/env python3
+"""Astraeus Link — make_badges.py (v0.4)
+Reads metrics.json (+ corridor) and writes badges/summary.svg
+Badges: CHI, ECR, ΔS, ΔR, breach_rate (and optional latency_p95)
+"""
+from __future__ import annotations
+import argparse, json, math
+from pathlib import Path
+try:
+    import yaml  # optional
+    _HAS_YAML = True
+except Exception:
+    _HAS_YAML = False
+
+CHAR_W = 7  # px approximation for width calc
+PAD = 6     # horizontal padding per side
+RADIUS = 4
+FONT = "font-family='DejaVu Sans,Verdana,Arial'; font-size='11px'"
+
+GREEN = "#2ea44f"; YELLOW = "#dbab09"; RED = "#d73a49"; DARK = "#555"
+
+LABELS = [
+    ("CHI",      "chi_mean"),
+    ("ECR",      "ecr_mean"),
+    ("ΔS",       "delta_s_mean"),
+    ("ΔR",       "delta_r_mean"),
+    ("breach",   "breach_rate"),
+]
+
+class Corridor:
+    def __init__(self, d: dict):
+        thr = d.get('thresholds', {})
+        ds = thr.get('delta_s', {})
+        dr = thr.get('delta_r', {})
+        self.ds_min = float(ds.get('min', -0.20)); self.ds_tar = float(ds.get('target', -0.05)); self.ds_max = float(ds.get('max', 0.02))
+        self.dr_max = float(dr.get('max', 0.03))
+        self.chi_min = float((thr.get('chi') or {}).get('min', 0.90))
+        self.ecr_min = float((thr.get('ecr') or {}).get('min', 0.90))
+
+    @staticmethod
+    def load(path: Path|None) -> 'Corridor':
+        if not path or not path.exists() or not _HAS_YAML:
+            return Corridor({})
+        return Corridor(yaml.safe_load(path.read_text()) or {})
+
+
+def color_for(key: str, val: float, C: Corridor) -> str:
+    if key == 'chi_mean':
+        return GREEN if val >= C.chi_min else RED
+    if key == 'ecr_mean':
+        return GREEN if val >= C.ecr_min else RED
+    if key == 'delta_s_mean':
+        if val <= C.ds_tar: return GREEN
+        if val <= C.ds_max: return YELLOW
+        return RED
+    if key == 'delta_r_mean':
+        if val <= C.dr_max: return GREEN
+        return RED
+    if key == 'breach_rate':
+        return GREEN if val <= 0.05 else YELLOW if val <= 0.10 else RED
+    return DARK
+
+
+def fmt(key: str, v: float) -> str:
+    if key in ('chi_mean','ecr_mean'): return f"{v:.2f}"
+    if key in ('delta_s_mean','delta_r_mean'): return f"{v:+.2f}"
+    if key == 'breach_rate': return f"{v*100:.1f}%"
+    return f"{v:.2f}"
+
+
+def badge_svg(label: str, value: str, color: str) -> tuple[str,int]:
+    lw = PAD*2 + len(label)*CHAR_W
+    vw = PAD*2 + len(value)*CHAR_W
+    w = lw + vw
+    svg = (
+        f"<g>\n"
+        f"  <rect rx='{RADIUS}' width='{w}' height='20' fill='{DARK}'/>\n"
+        f"  <rect rx='{RADIUS}' x='{lw}' width='{vw}' height='20' fill='{color}'/>\n"
+        f"  <g fill='#fff' {FONT} text-anchor='middle'>\n"
+        f"    <text x='{lw/2}' y='14'>{label}</text>\n"
+        f"    <text x='{lw + vw/2}' y='14'>{value}</text>\n"
+        f"  </g>\n"
+        f"</g>\n"
+    )
+    return svg, w
+
+
+def render(badges: list[tuple[str,str,str]]) -> str:
+    # horizontal layout with 6px gaps
+    x = 0; parts = []
+    for (lab, val, col) in badges:
+        svg, w = badge_svg(lab, val, col)
+        parts.append(f"<g transform='translate({x},0)'>\n{svg}</g>")
+        x += w + 6
+    W = x - 6 if x else 0
+    H = 20
+    return (f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}'>" + "".join(parts) + "</svg>")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--metrics', required=True, type=Path)
+    ap.add_argument('--corridor', required=False, type=Path)
+    ap.add_argument('--out', required=True, type=Path)
+    a = ap.parse_args()
+
+    M = json.loads(a.metrics.read_text(encoding='utf-8'))
+    C = Corridor.load(a.corridor)
+
+    badges = []
+    for lab, key in LABELS:
+        if key not in M: continue
+        v = float(M[key])
+        col = color_for(key, v, C)
+        badges.append((lab, fmt(key, v), col))
+    if 'latency_p95' in M and M['latency_p95'] is not None:
+        v = float(M['latency_p95']); col = GREEN if v <= 200 else YELLOW if v <= 400 else RED
+        badges.append(("p95", f"{v:.0f}ms", col))
+
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    a.out.write_text(render(badges), encoding='utf-8')
+    print(f"[badges] wrote → {a.out}")
+
+if __name__ == '__main__':
+    main()
+```
+
+> 의존성 없음(표준 라이브러리만 사용). `PyYAML`은 코리도어 색상 기준을 불러올 때만 필요합니다.
+
+---
+
+## 3) README 스니펫 (배지 포함)
+
+````md
+## Quickstart
+```bash
+pip install -r requirements.txt
+make poc
+make eval
+````
+
+**Metrics Badges**
+![Astraeus Metrics](badges/summary.svg)
+
+````
+
+---
+## 4) (선택) GitHub Actions — 배지 자동 업데이트 `.github/workflows/badges.yml`
+```yaml
+name: Astraeus Badges
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  build-badges:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          mkdir -p outputs configs badges
+          [ -f configs/corridor.default.yaml ] || printf "%s\n" "thresholds:\n  delta_s: { min: -0.20, target: -0.05, max: 0.02 }\n  delta_r: { min: -0.10, max: 0.03 }\n  chi:     { min: 0.90 }\n  ecr:     { min: 0.90 }" > configs/corridor.default.yaml
+          python scripts/run_eval.py --config configs/cross_domain.yaml || true
+          python scripts/compute_metrics.py --psi-log outputs/psi_log.jsonl --corridor configs/corridor.default.yaml --out outputs/metrics.json
+          python scripts/make_badges.py --metrics outputs/metrics.json --corridor configs/corridor.default.yaml --out badges/summary.svg
+      - uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update metrics badges"
+          file_pattern: badges/summary.svg outputs/metrics.json
+````
+
+---
+
+## 5) 배치 테스트
+
+```bash
+# 1) 의존성
+pip install -r requirements.txt
+# 2) 데모 로그 생성
+make poc
+# 3) 평가 + 배지 생성
+make eval
+# 4) 로컬에서 배지 열기
+python -c "import webbrowser; webbrowser.open('file://' + __import__('pathlib').Path('badges/summary.svg').resolve().as_posix())"
+```
+
+---
+
+**끝. 이 문서의 Makefile/스크립트/워크플로를 리포에 그대로 추가하면 Quickstart 배지 확인이 즉시 가능합니다.**
