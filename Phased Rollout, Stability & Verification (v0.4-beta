@@ -1,0 +1,264 @@
+# Astraeus Link — Phased Rollout, Stability & Verification (v0.4‑beta)
+
+> 목적: 7-Module Pack을 **단계적(Phase)으로 안전 도입**하면서, **복잡성·지연·검증 가능성** 우려를 해소하기 위한 실행 설계(토글, 예산, 안정화, A/B, 관측)와 코드/설정 스켈레톤을 한 문서로 제공합니다.
+
+---
+
+## 0) Executive Summary
+
+* **Phase 도입**: P1(CFFL+Resource‑Control) → P2(ACS) → P3(IBR/PEAL/RGA/Knowledge) — 각 단계는 **성공 기준** 충족 시에만 승격.
+* **복잡성 억제**: Orchestrator가 모듈 **DAG + Circuit Breaker + Cool‑down**으로 체인 오실레이션 방지.
+* **성능 예산**: 모듈·전체 파이프라인 **ms 예산** 설정 및 CI/런타임 게이트.
+* **검증 가능성**: ΔS/ΔR/CHI/ECR 측정 경로 명확화, A/B 설계·표본계획·성공 기준.
+
+---
+
+## 1) Phased Rollout Plan
+
+### Phase 1 — CFFL + Resource‑Control (2주)
+
+* **목표**: ΔR 무증가(≤0.00±0.01), ΔS 감소(≤−0.03), 오버헤드 p95 ≤ **80ms**
+* **성공 기준**: `breach_rate ≤ 0.05 ∧ delta_r_mean ≤ 0.02 ∧ overhead_p95 ≤ 80ms`
+
+### Phase 2 — + ACS (2주)
+
+* **목표**: CHI/ECR ≥ **0.92** 유지, 오버헤드 p95 ≤ **140ms**
+* **성공 기준**: `chi_mean ≥ 0.92 ∧ ecr_mean ≥ 0.92 ∧ overhead_p95 ≤ 140ms`
+
+### Phase 3 — + IBR/PEAL/RGA/Knowledge (4주)
+
+* **목표**: 전체 오버헤드 p95 ≤ **200ms**, Landauer/지연벽 보고 체계 정착
+* **성공 기준**: `total_pipeline_overhead_ms ≤ 200(p95)` + 감사 체인 무불일치
+
+### Feature Flags (모듈 토글)
+
+```yaml
+# configs/features.yaml
+modules:
+  cffl:       { enabled: true }
+  resource:   { enabled: true }
+  acs:        { enabled: false }
+  ibr:        { enabled: false }
+  peal:       { enabled: false }
+  rga:        { enabled: false }
+  knowledge:  { enabled: false }
+```
+
+---
+
+## 2) Performance Budget & Monitoring
+
+```yaml
+# configs/perf.thresholds.yaml
+performance_thresholds:
+  cffl_decision_time_ms: 50
+  acs_enforce_time_ms:   40
+  ibr_lint_time_ms:      30
+  peal_calc_time_ms:     20
+  rga_hashcheck_ms:      10
+  total_pipeline_overhead_ms: 200
+observability:
+  export: otlp  # OpenTelemetry 호환
+  sampling:
+    traces: 0.1  # 10% 샘플링
+    logs:   1.0
+```
+
+**메트릭 명세(권장):**
+
+* `astr.module.duration_ms{module}` — 처리 시간
+* `astr.pipe.overhead_ms` — 모듈 합산
+* `astr.slo.breach{kind}` — 코리도어/성능 위반 카운터
+* `astr.loop.escalation_count` — 3→5→7 단계 전환 횟수
+
+---
+
+## 3) Orchestrator (DAG, Circuit Breaker, Cool‑down)
+
+```python
+# scripts/orchestrator.py (skeleton)
+import time, json, contextlib
+from pathlib import Path
+from typing import Dict, Any, List
+import yaml
+
+class Timer:
+    def __enter__(self):
+        self.s = time.perf_counter(); return self
+    def __exit__(self, *exc):
+        self.ms = (time.perf_counter()-self.s)*1000
+
+class CircuitBreaker:
+    def __init__(self, threshold:int=3, cooldown_s:int=60):
+        self.fail=0; self.open_until=0; self.th=threshold; self.cool=cooldown_s
+    def allow(self):
+        return time.time() >= self.open_until
+    def trip(self):
+        self.fail += 1
+        if self.fail >= self.th:
+            self.open_until = time.time()+self.cool
+    def reset(self): self.fail=0
+
+class Orchestrator:
+    def __init__(self, features:Dict[str,Any], perf:Dict[str,Any]):
+        self.features=features; self.perf=perf
+        self.cb = {m: CircuitBreaker() for m, v in features['modules'].items()}
+        self.cooldown = { 'cffl': 5, 'acs': 5 }
+        self.last_run = {}
+
+    def _run(self, name:str, fn, *a, **kw):
+        if not self.features['modules'].get(name, {}).get('enabled'): return {'skip': True, 'ms': 0}
+        if not self.cb[name].allow(): return {'skip': True, 'ms': 0, 'cb': True}
+        # cooldown (anti-oscillation)
+        if (t := self.last_run.get(name)) and (time.time()-t < self.cooldown.get(name,0)):
+            return {'skip': True, 'ms': 0, 'cd': True}
+        with Timer() as tmr:
+            try:
+                out = fn(*a, **kw)
+                self.cb[name].reset()
+            except Exception:
+                self.cb[name].trip(); raise
+        self.last_run[name] = time.time()
+        return {'skip': False, 'ms': tmr.ms, 'out': out}
+
+    def handle(self, req:Dict[str,Any]) -> Dict[str,Any]:
+        # DAG: resource → cffl → acs → ibr → peal → rga → knowledge
+        acc: List[Dict[str,Any]] = []
+        total_ms = 0
+        def _sum(r):
+            if not r.get('skip'): return r['ms']
+            return 0
+        # replace lambdas with real adapters
+        r = self._run('resource', lambda x: {'route':'LIGHT' if len(x['q'])<50 else 'FULL'}, req); total_ms += _sum(r); acc.append({'resource':r})
+        r = self._run('cffl',     lambda: {'patch':'none'}, ); total_ms += _sum(r); acc.append({'cffl':r})
+        r = self._run('acs',      lambda: {'ok':True}); total_ms += _sum(r); acc.append({'acs':r})
+        r = self._run('ibr',      lambda: {'lint':'ok'}); total_ms += _sum(r); acc.append({'ibr':r})
+        r = self._run('peal',     lambda: {'e_min_J':0.0}); total_ms += _sum(r); acc.append({'peal':r})
+        r = self._run('rga',      lambda: {'hash':'ok'}); total_ms += _sum(r); acc.append({'rga':r})
+        r = self._run('knowledge',lambda: {'ingested':0}); total_ms += _sum(r); acc.append({'knowledge':r})
+        return { 'trace': acc, 'overhead_ms': total_ms }
+
+if __name__=='__main__':
+    features = yaml.safe_load(open('configs/features.yaml'))
+    perf = yaml.safe_load(open('configs/perf.thresholds.yaml'))
+    orch = Orchestrator(features, perf)
+    out = orch.handle({'q':'hello world'})
+    Path('outputs/pipe_trace.json').write_text(json.dumps(out, indent=2))
+    print(out['overhead_ms'])
+```
+
+---
+
+## 4) Stability Controls (Anti‑Oscillation)
+
+* **Hysteresis/Deadband**: 패치 적용/해제에 **상이한 임계** 사용(예: 적용: χ≤0.92, 해제: χ≥0.94)
+* **Rate‑limit & Cool‑down**: 모듈별 최소 간격(초) — CFFL 5s, ACS 5s
+* **EWMA(λ=0.2)**: ΔR/CHI/ECR 평활화 후 판단
+* **Anti‑windup**: 연쇄 패치 실패 시 강제 휴지기(예: 60s) 후 기본 상태 복구
+
+예시 설정:
+
+```yaml
+# configs/stability.yaml
+apply_thresholds: { chi_apply: 0.92, chi_release: 0.94 }
+cooldowns: { cffl_s: 5, acs_s: 5 }
+retry_backoff_s: [1, 2, 4, 8, 16]
+```
+
+---
+
+## 5) Verifiable Metrics (ΔS/ΔR/CHI/ECR)
+
+* **ΔS**: 로그확률 기반(가능 시) 또는 압축 근사, 길이 정규화·온도 보정
+* **ΔR**: 위험 벡터(정책/프라이버시/보안/성능…) 심각도 가중 + EWMA
+* **CHI**: 주장 추출 → NLI(지지/반박) → 충돌률ρ → `1−ρ`
+* **ECR**: 카테고리 가중 위반율(스팟체크→교정)
+
+`compute_metrics.py`에 다음 필드를 추가 권장: `overhead_ms`, `module_breakdown{module:duration_ms}`.
+
+---
+
+## 6) A/B & Experiment Design
+
+* **디자인**: 50/50, 랜덤 시드 고정, 사용자군/주제군 **층화**
+* **표본(대략)**: 비율형(χ/ECR)에서 5%p 차이를 95% 신뢰·80% 검정력으로 탐지하려면 군당 ≈ **\~600 샘플**
+* **성공 기준**: `ΔR_mean ≤ control + 0.01` AND `CHI/ECR ≥ control` AND `overhead_p95 ≤ budget`
+* **람프**: 5% → 25% → 50% (각 단계 48h, breach=롤백)
+* **분석**: 두 비율 z-test, 평균 t-test + Cliff’s δ(효과크기), 연속 유의성은 **보정(알파분할)**
+
+---
+
+## 7) Simulation Harness (성능/안정성 사전 점검)
+
+```python
+# scripts/simulate_pipeline.py (skeleton)
+import random, time, json
+from orchestrator import Orchestrator
+import yaml
+
+features=yaml.safe_load(open('configs/features.yaml'))
+perf=yaml.safe_load(open('configs/perf.thresholds.yaml'))
+orch=Orchestrator(features, perf)
+rows=[]
+for i in range(1000):
+    q = 'x'*random.randint(10, 200)
+    t0=time.perf_counter(); out=orch.handle({'q':q}); dt=(time.perf_counter()-t0)*1000
+    rows.append({'i':i,'overhead_ms':dt,'route':out['trace'][0]['resource'].get('out',{}).get('route','?')})
+open('outputs/sim_overhead.jsonl','w').write('\n'.join(map(json.dumps, rows)))
+print('p95≈', sorted(r['overhead_ms'] for r in rows)[int(0.95*len(rows))-1])
+```
+
+---
+
+## 8) CI Gates (성능 + 안전, 멀티스테이지)
+
+* **Stage‑A (Smoke)**: ψ-log 생성, `count>0`
+* **Stage‑B (Safety)**: `breach_rate ≤ 0.05 ∧ chi_mean ≥ 0.90 ∧ ecr_mean ≥ 0.90 ∧ delta_r_mean ≤ 0.03`
+* **Stage‑C (Perf)**: `overhead_p95 ≤ 200ms ∧ cffl_decision_time_ms ≤ 50`(샘플 기반)
+* 실패 시: 라우팅 상향→재시도, 불가 시 **E‑Stop 라벨**로 머지 차단
+
+---
+
+## 9) Risk Register (창발/사슬 위험)
+
+| 체인       | 리스크             | 신호                 | 완화                               |
+| -------- | --------------- | ------------------ | -------------------------------- |
+| CFFL→IBR | 패치가 편향 선언과 충돌   | χ 변동 분산↑           | Deadband, 듀얼 리뷰(Owner+Consulted) |
+| IBR→PEAL | 편향 완화로 토큰↑→에너지↑ | energy\_mean↑      | 토큰 상한/에너지 페널티                    |
+| PEAL→RGA | 보고량 증가→검증 지연    | latency\_p95↑      | 샘플링, 배치 검증                       |
+| 전체       | 오실레이션           | escalation\_count↑ | Cool‑down, Backoff, Stage revert |
+
+---
+
+## 10) Quickstart
+
+1. `configs/features.yaml`로 Phase‑1(기본) 활성화 후 `scripts/orchestrator.py` 실행
+2. `scripts/simulate_pipeline.py`로 p95 오버헤드 확인 → 임계 조정
+3. `A/B` 플래그 켜고 48h 램프 진행 → 게이트 통과 시 Phase‑2로 승격
+
+---
+
+## 부록 A — Telemetry 예시(OTLP‑like JSON)
+
+```json
+{
+  "time":"2025-08-24T14:05:00Z",
+  "trace_id":"t-993e",
+  "metrics":{
+    "astr.module.duration_ms":{"labels":{"module":"cffl"},"value":32.1},
+    "astr.pipe.overhead_ms": 168.4,
+    "astr.slo.breach":{"labels":{"kind":"perf"},"value":0}
+  }
+}
+```
+
+## 부록 B — README 주입용 배지(예시)
+
+```
+![Perf Budget](https://img.shields.io/badge/overhead_p95-≤200ms-green)
+![Safety Gate](https://img.shields.io/badge/breach_rate-≤5%25-green)
+```
+
+---
+
+> 본 문서는 7‑Module Pack의 **단계적 도입/안정화/검증**을 위한 즉시 실행 가능한 스펙입니다. 리포에 `configs/*`, `scripts/*`를 추가하고 CI Stage‑B/C 게이트만 켜면 운영 준비가 완료됩니다.
