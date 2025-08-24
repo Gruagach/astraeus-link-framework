@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Astraeus One — Single-file pipeline
+- 입력 메시지 → (더미)응답 생성 → ψ-log 기록(JSONL) → 메트릭 집계 →
+  게이트 검사 → 배지(SVG) 생성까지 **한 파일**에 모두 포함.
+- 외부 의존성 0(표준 라이브러리만 사용).
+
+사용 예시
+$ python astraeus_one.py --msg "요약해줘"
+$ python astraeus_one.py --msg "A" --msg "B" --dump-log
+$ python astraeus_one.py              # 데모 배치 3건 실행
+
+기본 임계(트라이애드 불변량)
+  ΔS ≤ -0.05, ΔR ≤ 0.03, CHI ≥ 0.90, ECR ≥ 0.90
+
+출력 경로(기본)
+  outputs/psi_log.jsonl, outputs/metrics.json, badges/summary.svg
+"""
+from __future__ import annotations
+import argparse, json, os, random, sys, time, math, statistics
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Tuple
+
+# --------- Triad Invariants(기본값) ---------
+TRIAD = {
+    "heaven": {"chi_min": 0.90, "ecr_min": 0.90},
+    "earth":  {"delta_s_target": -0.05, "delta_r_max": 0.03, "p95_latency_ms": 2000},
+    "human":  {"dual_governance": True, "frame_audit": {"cadence": "weekly", "hash_chain": True}}
+}
+
+# --------- 데이터 구조 ---------
+@dataclass
+class PsiLogRow:
+    ts: str
+    req_id: str
+    user_message: str
+    llm_response: str
+    metrics: Dict[str, float]
+    resource: Dict[str, float]
+    result: str
+
+# --------- 유틸 ---------
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def p95(values: List[float]) -> float:
+    if not values: return 0.0
+    s = sorted(values)
+    k = max(0, min(int(math.ceil(0.95*len(s))) - 1, len(s)-1))
+    return float(s[k])
+
+# --------- (데모) LLM 응답 & 셀프체크 ---------
+def generate_llm_response(user_message: str) -> str:
+    """실제 LLM 호출 대신 더미 응답을 생성합니다."""
+    pool = [
+        "요청하신 내용을 요약해 드리겠습니다.",
+        "분석을 위해 가정을 명시하고 근거를 덧붙이겠습니다.",
+        "불확실하니 보수적으로 답하겠습니다.",
+        "This is a placeholder response for demo.",
+    ]
+    return random.choice(pool)
+
+def self_check_metrics(user_message: str, answer: str) -> Tuple[float,float,float,float]:
+    """ΔS, ΔR, CHI, ECR(데모용 난수 기반; 통과 확률 30% 정도)"""
+    if random.random() < 0.30:
+        delta_s = random.uniform(-0.12, -0.05)  # 통과 가능성↑
+        delta_r = random.uniform(0.00, 0.03)
+        chi     = random.uniform(0.90, 0.99)
+        ecr     = random.uniform(0.90, 0.99)
+    else:
+        delta_s = random.uniform(-0.10, 0.10)
+        delta_r = random.uniform(0.00, 0.06)
+        chi     = random.uniform(0.85, 0.96)
+        ecr     = random.uniform(0.85, 0.96)
+    return (round(delta_s,6), round(delta_r,6), round(chi,6), round(ecr,6))
+
+# --------- 배지(SVG) ---------
+def color_ok(val: float, good: float, warn: float) -> str:
+    if val >= good: return "#2E7D32"
+    if val >= warn: return "#F9A825"
+    return "#C62828"
+
+def color_inv_ok(val: float, max_good: float, max_warn: float) -> str:
+    if val <= max_good: return "#2E7D32"
+    if val <= max_warn: return "#F9A825"
+    return "#C62828"
+
+def write_badge(metrics: Dict[str, Any], ok: bool, out_svg: str) -> None:
+    chi, ecr = float(metrics["chi_mean"]), float(metrics["ecr_mean"])
+    ds, dr = float(metrics["delta_s_mean"]), float(metrics["delta_r_mean"])
+    br = float(metrics.get("breach_rate", 0.0))
+    c_chi = color_ok(chi, 0.92, TRIAD["heaven"]["chi_min"])  # 0.92/0.90
+    c_ecr = color_ok(ecr, 0.95, TRIAD["heaven"]["ecr_min"])  # 0.95/0.90
+    c_ds  = color_inv_ok(ds, TRIAD["earth"]["delta_s_target"], -0.02)
+    c_dr  = color_inv_ok(dr, TRIAD["earth"]["delta_r_max"], 0.05)
+    c_br  = color_inv_ok(br, 0.05, 0.10)
+    label = "✔ PASSED" if ok else "✖ FAILED"
+    label_color = "#2E7D32" if ok else "#C62828"
+    svg = f"""
+<svg xmlns='http://www.w3.org/2000/svg' width='560' height='86'>
+  <style>.t{{font:14px sans-serif; fill:#fff}} .k{{font:12px sans-serif; fill:#eee}}</style>
+  <rect width='560' height='86' fill='#263238' rx='10'/>
+  <text x='16' y='22' class='k'>Astraeus Metrics</text>
+  <text x='440' y='22' class='t' fill='{label_color}'>{label}</text>
+  <rect x='16'  y='30' width='95' height='36' rx='6' fill='{c_chi}'/>
+  <text x='24'  y='53' class='t'>CHI: {chi:.3f}</text>
+  <rect x='121' y='30' width='95' height='36' rx='6' fill='{c_ecr}'/>
+  <text x='129' y='53' class='t'>ECR: {ecr:.3f}</text>
+  <rect x='226' y='30' width='95' height='36' rx='6' fill='{c_ds}'/>
+  <text x='234' y='53' class='t'>ΔS: {ds:.3f}</text>
+  <rect x='331' y='30' width='95' height='36' rx='6' fill='{c_dr}'/>
+  <text x='339' y='53' class='t'>ΔR: {dr:.3f}</text>
+  <rect x='436' y='30' width='108' height='36' rx='6' fill='{c_br}'/>
+  <text x='444' y='53' class='t'>Breach: {br:.3f}</text>
+</svg>"""
+    os.makedirs(os.path.dirname(out_svg), exist_ok=True)
+    with open(out_svg, "w", encoding="utf-8") as f:
+        f.write(svg)
+
+# --------- 파이프라인 ---------
+def run_pipeline(messages: List[str], outdir: str = "outputs", make_badge: bool = True, dump_log: bool = False) -> Dict[str, Any]:
+    os.makedirs(outdir, exist_ok=True)
+    log_path = os.path.join(outdir, "psi_log.jsonl")
+    rows: List[PsiLogRow] = []
+
+    for i, msg in enumerate(messages, start=1):
+        t0 = time.time()
+        ans = generate_llm_response(msg)
+        # (데모) 처리 지연 흉내
+        time.sleep(random.uniform(0.01, 0.05))
+        delta_s, delta_r, chi, ecr = self_check_metrics(msg, ans)
+        latency_ms = int((time.time() - t0) * 1000)
+        passed = (delta_s <= TRIAD["earth"]["delta_s_target"] and
+                  delta_r <= TRIAD["earth"]["delta_r_max"] and
+                  chi >= TRIAD["heaven"]["chi_min"] and
+                  ecr >= TRIAD["heaven"]["ecr_min"])  # type: ignore
+        row = PsiLogRow(
+            ts=now_iso(),
+            req_id=f"{int(time.time()*1000)}-{i}",
+            user_message=msg,
+            llm_response=ans,
+            metrics={"chi": chi, "ecr": ecr, "delta_s": delta_s, "delta_r": delta_r},
+            resource={"latency_ms": float(latency_ms), "prompt_tokens": 300+i*3, "completion_tokens": 120},
+            result=("PASSED" if passed else "FAILED")
+        )
+        rows.append(row)
+
+    # ψ-log JSONL로 기록
+    with open(log_path, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(asdict(r), ensure_ascii=False) + "\n")
+    if dump_log:
+        print("\nψ-log preview:")
+        for r in rows[:min(3, len(rows))]:
+            print(json.dumps(asdict(r), ensure_ascii=False))
+
+    # 메트릭 집계
+    chis = [r.metrics["chi"] for r in rows]
+    ecrs = [r.metrics["ecr"] for r in rows]
+    dss  = [r.metrics["delta_s"] for r in rows]
+    drs  = [r.metrics["delta_r"] for r in rows]
+    lats = [r.resource.get("latency_ms", 0.0) for r in rows]
+
+    metrics = {
+        "count": len(rows),
+        "chi_mean": round(sum(chis)/len(chis), 4),
+        "ecr_mean": round(sum(ecrs)/len(ecrs), 4),
+        "delta_s_mean": round(sum(dss)/len(dss), 4),
+        "delta_r_mean": round(sum(drs)/len(drs), 4),
+        "latency_p95_ms": round(p95(lats), 2)
+    }
+
+    # breach_rate 계산(임계 미달/초과 비율)
+    breaches = 0
+    for r in rows:
+        if (r.metrics["chi"] < TRIAD["heaven"]["chi_min"] or
+            r.metrics["ecr"] < TRIAD["heaven"]["ecr_min"] or
+            r.metrics["delta_r"] > TRIAD["earth"]["delta_r_max"] or
+            r.metrics["delta_s"] > TRIAD["earth"]["delta_s_target"]):
+            breaches += 1
+    metrics["breach_rate"] = round(breaches / max(1, len(rows)), 4)
+
+    # 게이트 합/부 판정(평균 기준)
+    ok = True
+    problems: List[str] = []
+    if metrics["chi_mean"] < TRIAD["heaven"]["chi_min"]:
+        ok = False; problems.append("chi_mean below min")
+    if metrics["ecr_mean"] < TRIAD["heaven"]["ecr_min"]:
+        ok = False; problems.append("ecr_mean below min")
+    if metrics["delta_r_mean"] > TRIAD["earth"]["delta_r_max"]:
+        ok = False; problems.append("delta_r_mean above max")
+    if metrics["delta_s_mean"] > TRIAD["earth"]["delta_s_target"]:
+        ok = False; problems.append("delta_s_mean above target")
+    if metrics["latency_p95_ms"] > TRIAD["earth"]["p95_latency_ms"]:
+        ok = False; problems.append("latency_p95 above budget")
+
+    # 저장
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+    # 배지
+    if make_badge:
+        os.makedirs("badges", exist_ok=True)
+        write_badge(metrics, ok, os.path.join("badges", "summary.svg"))
+
+    return {"ok": ok, "problems": problems, "metrics": metrics, "log_path": log_path}
+
+# --------- CLI ---------
+def main():
+    ap = argparse.ArgumentParser(description="Astraeus One: single-file governance pipeline")
+    ap.add_argument("--msg", action="append", help="처리할 메시지. 여러 번 지정 가능")
+    ap.add_argument("--outdir", default="outputs", help="결과 출력 디렉터리(기본: outputs)")
+    ap.add_argument("--dump-log", action="store_true", help="ψ-log 내용 프린트")
+    ap.add_argument("--no-badge", action="store_true", help="배지 생성 생략")
+    args = ap.parse_args()
+
+    messages = args.msg if args.msg else ["요약해줘", "다른 요청", "Hello, world!"]
+    if not args.msg:
+        print(f"기본 데모 모드: {len(messages)}개 메시지 처리")
+
+    res = run_pipeline(messages, outdir=args.outdir, make_badge=(not args.no_badge), dump_log=args.dump_log)
+
+    # 터미널 출력(컬러)
+    ok = res["ok"]
+    color = "\033[92m" if ok else "\033[91m"
+    reset = "\033[0m"
+    print(f"Gate report: {color}{'PASSED' if ok else 'FAILED'}{reset} — problems: {res['problems']}")
+    print("metrics:", json.dumps(res["metrics"], ensure_ascii=False))
+    print("psi_log:", res["log_path"]) 
+
+if __name__ == "__main__":
+    main()
