@@ -1,0 +1,354 @@
+"""
+Astraeus Link – Tri‑Seal Security Engine (single file)
+
+목적: 천부경 삼극을 운영 철학(2‑of‑3 Tri‑Seal)으로 차용한 보안 레퍼런스 엔진.
+기능: ψ‑log(ΔS/ΔR/CHI/ECR) + Assurance Envelope(논스/서명/해시체인) +
+      ACS(L0/L1/L2) 보수화 + E‑STOP/폴백/롤백 + 카나리 + 간단 런북 액션.
+
+주의: 데모 목적의 단일 파일. 실제 배포 시 HSM/KMS·Ed25519·SBOM/SLSA·권한분리로 강화 필요.
+의존성: 표준 라이브러리만 사용(선택적으로 pynacl이 설치되어 있으면 Ed25519 서명 사용).
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import time
+import uuid
+from dataclasses import dataclass, asdict, field
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Utilities
+# ──────────────────────────────────────────────────────────────────────────────
+
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode().rstrip("=")
+
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Data Models
+# ──────────────────────────────────────────────────────────────────────────────
+
+class Mode(Enum):
+    STANDARD = "STANDARD"  # 정상
+    ACS_L1 = "ACS_L1"      # 보수화 1단계
+    ACS_L2 = "ACS_L2"      # 보수화 2단계(도구 금지)
+    E_STOP = "E_STOP"      # 긴급 정지
+
+
+@dataclass
+class PsiMetrics:
+    chi: float
+    ecr: float
+    delta_s: float
+    delta_r: float
+    latency_ms: int = 0
+
+    def within(self, thresholds: Dict[str, float]) -> bool:
+        return (
+            self.chi >= thresholds.get("min_chi", 0.90)
+            and self.ecr >= thresholds.get("min_ecr", 0.90)
+            and self.delta_r <= thresholds.get("max_delta_r", 0.03)
+        )
+
+
+@dataclass
+class TriadSeal:
+    """2‑of‑3 승인 모델. 서명 자체는 Envelope에서 수행. 여기선 승인 로직만 다룸."""
+    parties: Tuple[str, str, str] = ("heaven", "earth", "human")
+    threshold: int = 2
+    approvals: Dict[str, bool] = field(default_factory=dict)
+
+    def reset(self):
+        self.approvals = {p: False for p in self.parties}
+
+    def approve(self, party: str):
+        if party not in self.parties:
+            raise ValueError(f"unknown party: {party}")
+        self.approvals[party] = True
+
+    def satisfied(self) -> bool:
+        return sum(self.approvals.get(p, False) for p in self.parties) >= self.threshold
+
+
+class Signer:
+    """간단 서명자. pynacl이 있으면 Ed25519, 없으면 HMAC(SHA256) 사용."""
+
+    def __init__(self, key_id: str, secret: bytes):
+        self.key_id = key_id
+        self.secret = secret
+        try:  # Optional Ed25519
+            from nacl.signing import SigningKey
+            self._ed25519 = SigningKey(secret)
+            self.alg = "Ed25519"
+        except Exception:
+            self._ed25519 = None
+            self.alg = "HMAC-SHA256"
+
+    def sign(self, msg: bytes) -> str:
+        if self._ed25519:
+            sig = self._ed25519.sign(msg).signature
+            return b64(sig)
+        return b64(hmac.new(self.secret, msg, hashlib.sha256).digest())
+
+    def verify(self, msg: bytes, sig_b64: str) -> bool:
+        if self._ed25519:
+            try:
+                from nacl.signing import VerifyKey
+                from nacl.exceptions import BadSignatureError
+                vk = self._ed25519.verify_key
+                vk.verify(msg, base64.urlsafe_b64decode(sig_b64 + "=="))
+                return True
+            except Exception:
+                return False
+        # HMAC verify
+        expected = self.sign(msg)
+        return hmac.compare_digest(expected, sig_b64)
+
+
+@dataclass
+class Envelope:
+    version: str
+    psi_metrics: PsiMetrics
+    policy_tags: List[str]
+    triad_seal: Dict[str, object]
+    nonce: str
+    prev_digest: str
+    signature: Dict[str, str]
+
+    def to_json(self) -> str:
+        d = {
+            "version": self.version,
+            "psi_metrics": asdict(self.psi_metrics),
+            "policy_tags": self.policy_tags,
+            "triad_seal": self.triad_seal,
+            "nonce": self.nonce,
+            "prev_digest": self.prev_digest,
+            "signature": self.signature,
+        }
+        return json.dumps(d, separators=(",", ":"), sort_keys=True)
+
+
+class EnvelopeBuilder:
+    def __init__(self, signer: Signer, prev_digest: str = ""):
+        self.signer = signer
+        self.prev_digest = prev_digest
+
+    def build(self, metrics: PsiMetrics, policy_tags: List[str], triad: TriadSeal) -> Envelope:
+        nonce = b64(uuid.uuid4().bytes)
+        triad_info = {
+            "required": triad.threshold,
+            "parties": list(triad.parties),
+            "signers": [p for p, ok in triad.approvals.items() if ok],
+        }
+        temp = {
+            "version": "0.2",
+            "psi_metrics": asdict(metrics),
+            "policy_tags": policy_tags,
+            "triad_seal": triad_info,
+            "nonce": nonce,
+            "prev_digest": self.prev_digest,
+        }
+        msg = json.dumps(temp, separators=(",", ":"), sort_keys=True).encode()
+        sig_b64 = self.signer.sign(msg)
+        envelope = Envelope(
+            version="0.2",
+            psi_metrics=metrics,
+            policy_tags=policy_tags,
+            triad_seal=triad_info,
+            nonce=nonce,
+            prev_digest=self.prev_digest,
+            signature={"alg": self.signer.alg, "sig": sig_b64, "kid": self.signer.key_id},
+        )
+        # update chain
+        self.prev_digest = sha256_hex(envelope.to_json())
+        return envelope
+
+
+@dataclass
+class CorridorProfile:
+    name: str
+    tools: List[str]
+    requests_per_min: int
+    canary_percent: float
+    abort_on: Dict[str, float]  # {"deltaR":0.03, "minECR":0.90, "minCHI":0.90}
+    fallback_seq: List[str]
+    retention_days: int
+
+    @staticmethod
+    def incident_default() -> "CorridorProfile":
+        return CorridorProfile(
+            name="security.cbg.v1",
+            tools=[],
+            requests_per_min=10,
+            canary_percent=0.05,
+            abort_on={"deltaR": 0.03, "minECR": 0.90, "minCHI": 0.90},
+            fallback_seq=["safe-summary", "human-review"],
+            retention_days=180,
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Policy / Guards
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class Hysteresis:
+    up_risk: float = 0.03
+    down_grace_sec: int = 30
+    last_escalation_ts: float = 0.0
+
+    def can_downgrade(self) -> bool:
+        return (time.time() - self.last_escalation_ts) >= self.down_grace_sec
+
+    def note_escalation(self):
+        self.last_escalation_ts = time.time()
+
+
+def triad_guard(signals: Dict[str, bool]) -> Mode:
+    """3 신호 중 2 이상이면 E‑STOP, 1개면 ACS_L1, 0개면 STANDARD."""
+    votes = sum(bool(signals.get(k, False)) for k in ["policy_violation", "deltaR_spike", "corridor_violation"])
+    if votes >= 2:
+        return Mode.E_STOP
+    if votes == 1:
+        return Mode.ACS_L1
+    return Mode.STANDARD
+
+
+class SecurityEngine:
+    def __init__(self, corridor: CorridorProfile, signer: Signer):
+        self.corridor = corridor
+        self.signer = signer
+        self.hys = Hysteresis()
+        self.triad = TriadSeal()
+        self.builder = EnvelopeBuilder(signer)
+        self.mode = Mode.STANDARD
+
+    # ── Core evaluation ────────────────────────────────────────────────────
+    def evaluate(self, m: PsiMetrics, policy_violated: bool = False, corridor_violated: bool = False) -> Mode:
+        deltaR_spike = m.delta_r > self.corridor.abort_on["deltaR"]
+        signals = {
+            "policy_violation": policy_violated or (m.ecr < self.corridor.abort_on["minECR"]),
+            "deltaR_spike": deltaR_spike,
+            "corridor_violation": corridor_violated or (m.chi < self.corridor.abort_on["minCHI"]),
+        }
+        guard_mode = triad_guard(signals)
+
+        # Escalation / De‑escalation with hysteresis
+        new_mode = self.mode
+        if guard_mode == Mode.E_STOP:
+            new_mode = Mode.E_STOP
+            self.hys.note_escalation()
+        elif guard_mode == Mode.ACS_L1:
+            if self.mode in (Mode.STANDARD, Mode.ACS_L1):
+                new_mode = Mode.ACS_L1
+                self.hys.note_escalation()
+        else:
+            # Only downgrade after grace
+            if self.mode in (Mode.ACS_L1, Mode.ACS_L2) and self.hys.can_downgrade():
+                new_mode = Mode.STANDARD
+
+        # Additional rule: if ECR or CHI very low → ACS_L2
+        if m.ecr < 0.85 or m.chi < 0.85:
+            new_mode = Mode.ACS_L2
+            self.hys.note_escalation()
+
+        self.mode = new_mode
+        return self.mode
+
+    # ── Actions per mode ───────────────────────────────────────────────────
+    def actions_for_mode(self) -> Tuple[List[str], List[str]]:
+        """returns (policy_tags, actions)"""
+        if self.mode == Mode.E_STOP:
+            return (["safe-summary", "no-tools", "e-stop"], ["ISOLATE_SESSION", "REVOKE_KEYS", "PAGE_ONCALL"])
+        if self.mode == Mode.ACS_L2:
+            return (["safe-summary", "no-tools"], ["REDUCE_PERMISSIONS", "HUMAN_REVIEW"])
+        if self.mode == Mode.ACS_L1:
+            return (["constrained"], ["RATE_LIMIT", "STRICT_RAG"])
+        return ([], ["NORMAL"])  # STANDARD
+
+    # ── Tri‑Seal workflow ──────────────────────────────────────────────────
+    def require_triad(self, high_risk_change: bool) -> bool:
+        if not high_risk_change:
+            return True
+        return self.triad.satisfied()
+
+    # ── Envelope building ──────────────────────────────────────────────────
+    def finalize(self, m: PsiMetrics) -> Envelope:
+        policy_tags, _ = self.actions_for_mode()
+        env = self.builder.build(m, policy_tags, self.triad)
+        return env
+
+    # ── Incident patch (switch to incident corridor) ───────────────────────
+    def apply_incident_patch(self):
+        self.corridor = CorridorProfile.incident_default()
+        self.mode = Mode.ACS_L2  # immediate conservative
+        self.hys.note_escalation()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Demo Scenarios
+# ──────────────────────────────────────────────────────────────────────────────
+
+def demo() -> None:
+    print("\nAstraeus Link – Tri‑Seal Security Engine DEMO\n")
+
+    # Signer (demo secret; 실제는 HSM/KMS)
+    signer = Signer(key_id="rot/2025-08", secret=hashlib.sha256(b"demo-secret").digest())
+    corridor = CorridorProfile.incident_default()  # incident‑safe 프로파일을 기본으로 사용
+    engine = SecurityEngine(corridor, signer)
+
+    # Tri‑Seal: 두 주체 승인(earth, human)
+    engine.triad.reset()
+    engine.triad.approve("earth")
+    engine.triad.approve("human")
+
+    # ── Scenario 1: 정상 흐름 ─────────────────────────────────────────────
+    m1 = PsiMetrics(chi=0.96, ecr=0.99, delta_s=-0.05, delta_r=0.01, latency_ms=250)
+    mode1 = engine.evaluate(m1)
+    env1 = engine.finalize(m1)
+    print("[S1] mode:", mode1.value)
+    print("[S1] envelope:", env1.to_json())
+
+    # ── Scenario 2: 공격(ΔR spike + ECR 하락) → E‑STOP ───────────────────
+    m2 = PsiMetrics(chi=0.88, ecr=0.82, delta_s=0.12, delta_r=0.07, latency_ms=1900)
+    mode2 = engine.evaluate(m2, policy_violated=True)
+    env2 = engine.finalize(m2)
+    print("\n[S2] mode:", mode2.value)
+    print("[S2] envelope:", env2.to_json())
+
+    # 런북 액션(간략): E‑STOP이면 격리/키 회수/온콜 알림
+    _, actions2 = engine.actions_for_mode()
+    print("[S2] actions:", actions2)
+
+    # ── Scenario 3: 패치 적용 후 카나리 복구 ─────────────────────────────
+    engine.apply_incident_patch()
+    print("\n[PATCH] incident corridor applied → mode:", engine.mode.value)
+
+    # 카나리에서 개선 확인(지표 회복)
+    time.sleep(1)
+    m3 = PsiMetrics(chi=0.93, ecr=0.96, delta_s=-0.03, delta_r=0.015, latency_ms=500)
+    mode3 = engine.evaluate(m3)
+    env3 = engine.finalize(m3)
+    print("[S3] mode:", mode3.value)
+    print("[S3] envelope:", env3.to_json())
+
+    # Tri‑Seal 요건 테스트(고위험 변경)
+    need_triad = not engine.require_triad(high_risk_change=True)
+    print("[S3] triad satisfied for high‑risk change?", not need_triad)
+
+
+if __name__ == "__main__":
+    demo()
