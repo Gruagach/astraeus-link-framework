@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Astraeus Link — GNSS × 외부3D × Corridor × ψ-log (v1.1)
+Single-file reference implementation (demo-ready, no external deps required)
+
+▶ What this is
+- 신뢰 벡터 λ = <λ_gnss, λ_lio, λ_map, λ_cloud>를 계산하고
+- 간이 Factor-like 융합기로 전역 포즈 추정(2D pose) 후
+- Corridor 점수 S→S' 보정, E-STOP 룰을 적용하며
+- ψ-log 및 Assurance Envelope(JSON)까지 남기는 단일 파이썬 모듈.
+
+▶ Requirements
+- Python 3.10+
+- (선택) numpy가 있으면 수치안정성이 조금 좋아집니다. 없어도 동작합니다.
+
+▶ Run
+$ python al_autonomy.py --demo
+
+Copyright (c) 2025 Astraeus Link
+License: Apache-2.0
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import random
+import time
+from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Optional, Tuple
+
+try:
+    import numpy as np  # optional
+except Exception:  # pragma: no cover
+    np = None
+
+# ----------------------------
+# Utils
+# ----------------------------
+
+def clip(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
+
+
+def now_ts() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def tile_id_from_pose(x: float, y: float, salt: int = 7) -> str:
+    """Privacy-friendly coarse tile id for logging (no raw coordinates).
+    We quantize meters into 50m tiles and salt with a small prime.
+    """
+    k = 50.0
+    tx, ty = int(math.floor(x / k)), int(math.floor(y / k))
+    h = (tx * 73856093) ^ (ty * 19349663) ^ (salt * 83492791)
+    return f"t{h & 0xFFFFFFFF:08x}"
+
+# ----------------------------
+# Data Models
+# ----------------------------
+
+@dataclass
+class Pose2D:
+    x: float
+    y: float
+    theta: float  # rad
+    sigma: float = 1.0  # global pos uncertainty (std, meters)
+
+
+@dataclass
+class GNSSMetrics:
+    hdop: float  # horizontal dilution of precision
+    sv_count: int
+    rtk_state: str  # 'none'|'float'|'fix'
+    residual: float  # meters
+
+
+@dataclass
+class LIOStatus:
+    residual: float  # scan-matching residual
+    loop_closure_ok: bool
+    imu_bias_ok: bool
+
+
+@dataclass
+class MapConsistency:
+    score: float  # 0..1
+    version: str
+
+
+@dataclass
+class CloudStatus:
+    rtt_ms: float
+    packet_loss: float  # 0..1
+    residual: float  # cloud pose vs onboard pose discrepancy (m)
+
+
+@dataclass
+class TrustVector:
+    gnss: float
+    lio: float
+    map: float
+    cloud: float
+
+    @staticmethod
+    def from_metrics(gnss: GNSSMetrics, lio: LIOStatus, m: MapConsistency, c: CloudStatus) -> "TrustVector":
+        # GNSS trust
+        t_g = 1.0
+        if gnss.hdop > 3.0 or gnss.sv_count < 6:
+            t_g *= 0.3
+        if gnss.rtk_state == "fix":
+            t_g *= 1.0
+        elif gnss.rtk_state == "float":
+            t_g *= 0.7
+        else:
+            t_g *= 0.4
+        # residual penalty (bigger residual -> lower trust)
+        t_g *= 1.0 / (1.0 + clip(gnss.residual, 0.0, 10.0))
+        t_g = clip(t_g, 0.0, 1.0)
+
+        # LIO trust
+        t_l = 1.0 / (1.0 + clip(lio.residual, 0.0, 5.0))
+        if not lio.loop_closure_ok:
+            t_l *= 0.6
+        if not lio.imu_bias_ok:
+            t_l *= 0.7
+        t_l = clip(t_l, 0.0, 1.0)
+
+        # Map trust
+        t_m = clip(m.score, 0.0, 1.0)
+
+        # Cloud trust (latency, loss, residual)
+        t_c = 1.0
+        if c.rtt_ms > 150.0:
+            t_c *= 0.5
+        if c.packet_loss > 0.05:
+            t_c *= 0.6
+        t_c *= 1.0 / (1.0 + clip(c.residual, 0.0, 10.0))
+        t_c = clip(t_c, 0.0, 1.0)
+
+        return TrustVector(gnss=t_g, lio=t_l, map=t_m, cloud=t_c)
+
+
+# ----------------------------
+# Fusion (Factor-like WLS)
+# ----------------------------
+
+@dataclass
+class Measurement:
+    source: str  # 'GNSS' | 'LIO' | 'MAP' | 'CLOUD'
+    pose: Pose2D
+    sigma: float  # measurement std (m)
+    weight: float  # trust 0..1
+
+
+class FusionEngine:
+    """Simple weighted least squares for 2D pose.
+    This is NOT a full factor graph, but captures the core idea for demo.
+    """
+
+    def __init__(self) -> None:
+        pass
+
+    @staticmethod
+    def fuse(meas: List[Measurement]) -> Pose2D:
+        if not meas:
+            return Pose2D(0.0, 0.0, 0.0, sigma=999.0)
+
+        # Weighted average for x, y, theta with inverse-variance * trust
+        num_x = num_y = num_t = 0.0
+        den = 0.0
+        for m in meas:
+            if m.sigma <= 0 or m.weight <= 0:
+                continue
+            w = m.weight / (m.sigma ** 2)
+            num_x += w * m.pose.x
+            num_y += w * m.pose.y
+            num_t += w * m.pose.theta
+            den += w
+        if den == 0:
+            return Pose2D(0.0, 0.0, 0.0, sigma=999.0)
+
+        x = num_x / den
+        y = num_y / den
+        theta = math.atan2(math.sin(num_t / den), math.cos(num_t / den))  # circular mean approx
+        sigma = math.sqrt(1.0 / den)
+        return Pose2D(x, y, theta, sigma=sigma)
+
+
+# ----------------------------
+# Corridor Scoring & E-STOP
+# ----------------------------
+
+@dataclass
+class Corridor:
+    cid: str
+    delta_r: float  # lower is better (we use -ΔR in score)
+    chi: float      # higher is better
+    energy: float   # cost
+    delta_s: float  # lower is better
+
+
+@dataclass
+class ScoreParams:
+    w1: float = 1.0  # -ΔR weight
+    w2: float = 1.0  # CHI weight
+    w3: float = 0.2  # Energy penalty
+    w4: float = 0.5  # ΔS penalty
+    alpha: Tuple[float, float, float, float] = (0.2, 0.3, 0.3, 0.2)  # f(λ) coeffs
+    tau_safe: float = 0.4
+
+
+def base_score(c: Corridor, p: ScoreParams) -> float:
+    return (
+        p.w1 * (-c.delta_r) +
+        p.w2 * c.chi -
+        p.w3 * c.energy -
+        p.w4 * c.delta_s
+    )
+
+
+def adjust_with_trust(s: float, lam: TrustVector, p: ScoreParams) -> float:
+    a0, a1, a2, a3 = p.alpha
+    f = a0 + a1 * lam.gnss + a2 * lam.map + a3 * lam.cloud
+    return s * f
+
+
+@dataclass
+class PlanResult:
+    best_id: Optional[str]
+    s_prime: Dict[str, float]
+    e_stop: bool
+
+
+class Planner:
+    def __init__(self, params: ScoreParams):
+        self.params = params
+
+    def evaluate(self, corridors: List[Corridor], lam: TrustVector) -> PlanResult:
+        s_prime: Dict[str, float] = {}
+        best_id = None
+        best_val = -1e9
+        for c in corridors:
+            s = base_score(c, self.params)
+            sp = adjust_with_trust(s, lam, self.params)
+            s_prime[c.cid] = sp
+            if sp > best_val:
+                best_val = sp
+                best_id = c.cid
+        e_stop = (best_val < self.params.tau_safe)
+        return PlanResult(best_id=best_id, s_prime=s_prime, e_stop=e_stop)
+
+
+# ----------------------------
+# ψ-log & Assurance Envelope
+# ----------------------------
+
+class PsiLogger:
+    def __init__(self, path: str = "psi_log.jsonl") -> None:
+        self.path = path
+
+    def log(self, record: Dict) -> None:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def assurance_envelope(metrics: Dict, provenance: Dict, risk: Dict) -> Dict:
+    return {
+        "schema": "al.assurance.v1",
+        "metrics": metrics,
+        "risk": risk,
+        "provenance": provenance,
+        "attest": {
+            "sig": "(placeholder)",
+            "hash": "sha256:(placeholder)",
+            "ts": now_ts(),
+        },
+    }
+
+
+# ----------------------------
+# Demo harness
+# ----------------------------
+
+def demo_once(seed: int = 42) -> None:
+    random.seed(seed)
+
+    # --- Fake inputs
+    gnss = GNSSMetrics(hdop=0.9, sv_count=14, rtk_state="fix", residual=0.3)
+    lio = LIOStatus(residual=0.2, loop_closure_ok=True, imu_bias_ok=True)
+    m = MapConsistency(score=0.92, version="2025.08.01")
+    c = CloudStatus(rtt_ms=82.0, packet_loss=0.01, residual=0.4)
+
+    lam = TrustVector.from_metrics(gnss, lio, m, c)
+
+    meas = [
+        Measurement("GNSS", Pose2D(120.0, 45.0, 0.02), sigma=0.05 if gnss.rtk_state=="fix" else 0.3, weight=lam.gnss),
+        Measurement("LIO",  Pose2D(121.0, 44.3, 0.01), sigma=0.40, weight=lam.lio),
+        Measurement("MAP",  Pose2D(119.6, 45.2, 0.00), sigma=0.60, weight=lam.map),
+        Measurement("CLOUD",Pose2D(120.2, 44.9, 0.02), sigma=0.80, weight=lam.cloud),
+    ]
+
+    fused = FusionEngine.fuse(meas)
+
+    # Example corridors (toy numbers)
+    corridors = [
+        Corridor("c_main",  delta_r=0.05, chi=0.95, energy=1.2, delta_s=0.02),
+        Corridor("c_detour",delta_r=0.03, chi=0.90, energy=0.9,  delta_s=0.03),
+        Corridor("c_stop",  delta_r=0.00, chi=0.70, energy=0.2,  delta_s=0.01),
+    ]
+
+    planner = Planner(ScoreParams())
+    plan = planner.evaluate(corridors, lam)
+
+    # ψ-metrics (toy):
+    delta_s = -0.03  # uncertainty reduced
+    delta_r = 0.01   # risk change (positive means worse)
+    chi = 0.94
+    ecr = 0.97
+
+    # E-STOP if needed
+    if plan.e_stop:
+        action = "E-STOP"
+    else:
+        action = f"FOLLOW:{plan.best_id}"
+
+    # ψ-log record (privacy: tile only)
+    rec = {
+        "ts": now_ts(),
+        "action": action,
+        "pose_tile": tile_id_from_pose(fused.x, fused.y),
+        "global_sigma": round(fused.sigma, 3),
+        "chi": chi,
+        "ecr": ecr,
+        "delta_s": delta_s,
+        "delta_r": delta_r,
+        "gnss_trust": round(lam.gnss, 3),
+        "hdop": gnss.hdop,
+        "sv_count": gnss.sv_count,
+        "rtk_state": gnss.rtk_state,
+        "cloud_latency_ms": c.rtt_ms,
+        "map_ver": m.version,
+        "energy_cost": sum(getattr(cd, "energy", 0.0) for cd in corridors) / len(corridors),
+        "audit_id": "fa-2025-08-25-001",
+        "raci": "OPS",
+    }
+
+    PsiLogger().log(rec)
+
+    # Assurance envelope example
+    metrics = {k: rec[k] for k in ("chi", "delta_s", "delta_r", "ecr")}
+    provenance = {
+        "map_ver": m.version,
+        "gnss_hdop": gnss.hdop,
+        "sv": gnss.sv_count,
+        "rtk": gnss.rtk_state,
+        "cloud_rtt_ms": c.rtt_ms,
+    }
+    risk = {"severity": "low" if not plan.e_stop else "high", "reasons": ["rss_ok", "global_anchor"]}
+    env = assurance_envelope(metrics, provenance, risk)
+
+    print("— FUSED:", fused)
+    print("— TRUST λ:", lam)
+    print("— S':", {k: round(v, 3) for k, v in plan.s_prime.items()}, "+ E-STOP=" + str(plan.e_stop))
+    print("— ψ-log → psi_log.jsonl (appended)")
+    print("— Assurance Envelope:")
+    print(json.dumps(env, ensure_ascii=False, indent=2))
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Astraeus Link autonomy demo")
+    parser.add_argument("--demo", action="store_true", help="run one demo cycle")
+    args = parser.parse_args()
+
+    if args.demo:
+        demo_once()
+    else:
+        print("Use --demo to run the example. See source for integration points.")
